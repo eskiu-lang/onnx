@@ -847,6 +847,42 @@ Result<OnnxTensor, string> onnx_tensor(int type, *void data, *int64 shape, int r
     return Ok<OnnxTensor, string>(t);
 }
 
+// A tensor over the caller's buffer, with no copy: `data` holds the elements and must
+// outlive the tensor. release() frees the tensor, not the buffer.
+Result<OnnxTensor, string> onnx_tensor_view(int type, *void data, *int64 shape, int rank) {
+    onnx_env()?;
+    int size = onnx_type_size(type);
+    if (size == 0 || type == ONNX_STRING) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: cannot make a tensor view of %s", onnx_type_name(type));
+        return Err<OnnxTensor, string>(_onnx_err.data);
+    }
+    if (data == null || rank < 0 || (rank > 0 && shape == null)) return Err<OnnxTensor, string>(_onnx_fail("onnx: bad tensor view", null));
+    uint64 count = 1;
+    for (i in 0..rank) {
+        if (shape[i] < 0) return Err<OnnxTensor, string>(_onnx_fail("onnx: a tensor shape cannot have a negative dimension", null));
+        count = count * (uint64)shape[i];
+    }
+    *OrtMemoryInfo info = null;
+    string e = _onnx_status(ort_CreateCpuMemoryInfo(OrtArenaAllocator, OrtMemTypeDefault, &info), "onnx: CreateCpuMemoryInfo");
+    if (e != null) return Err<OnnxTensor, string>(e);
+    defer ort_ReleaseMemoryInfo(info);
+    int64 one = 0;
+    *int64 dims = shape;
+    if (dims == null) dims = &one;
+    *OrtValue v = null;
+    e = _onnx_status(ort_CreateTensorWithDataAsOrtValue(info, data, count * (uint64)size, dims, (uint64)rank,
+        (ONNXTensorElementDataType)type, &v), "onnx: CreateTensorWithDataAsOrtValue");
+    if (e != null) return Err<OnnxTensor, string>(e);
+    OnnxTensor t;
+    e = _onnx_wrap(v, &t);
+    if (e != null) {
+        ort_ReleaseValue(v);
+        return Err<OnnxTensor, string>(_onnx_fail("onnx: tensor", e));
+    }
+    return Ok<OnnxTensor, string>(t);
+}
+
 Result<OnnxTensor, string> onnx_tensor_f32(*float data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_FLOAT, (*void)data, shape, rank);
 }

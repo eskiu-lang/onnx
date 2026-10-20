@@ -36,6 +36,15 @@ Result<int, string> run() {
             return Err<int, string>("output values");
         }
     }
+    // The same input through a view of x, with no copy.
+    OnnxTensor v = onnx_tensor_view(ONNX_FLOAT, (*void)x, &shape[0], 2)?;
+    defer v.release();
+    if (v.f32() != x) return Err<int, string>("view copied the buffer");
+    OnnxTensor yv = s.run1(&v)?;
+    defer yv.release();
+    for (i in 0..3) {
+        if (yv.f32()[i] != got[i]) return Err<int, string>("view output");
+    }
     return Ok<int, string>(0);
 }
 

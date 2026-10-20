@@ -108,7 +108,8 @@ for (i in 0..s.input_count()) {
 `onnx_tensor(type, data, shape, rank)` makes a tensor of any numeric element type and copies
 its elements from `data` (zeros when `data` is null); `onnx_tensor_f32`, `_f16`, `_i64`,
 `_i32` and `_u8` take typed pointers. The buffer belongs to ONNX Runtime and goes with
-`release()`. After a run, `t.f32()` (or `f16`, `i64`, `i32`, `u8`) is the data, null when the
+`release()`. `onnx_tensor_view(type, data, shape, rank)` wraps the caller's buffer instead,
+with no copy; the buffer must outlive the tensor. After a run, `t.f32()` (or `f16`, `i64`, `i32`, `u8`) is the data, null when the
 tensor holds another type; `t.at(i)` reads any numeric element as a `double`; `t.dim(i)`,
 `t.rank()` and `t.len()` give the shape; `t.argmax()` the index of the largest element.
 
