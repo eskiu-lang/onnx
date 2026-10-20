@@ -77,6 +77,7 @@ struct OnnxOptions {
     int device;
     bool fallback;
     string coreml_units;
+    string coreml_format;
     uint32 nnapi_flags;
     // ONNX Runtime session configuration entries, "key=value" pairs separated by
     // commas (AddSessionConfigEntry), e.g. "mlas.disable_kleidiai=1". The
@@ -278,11 +279,41 @@ void onnx_providers(String* out) {
     _onnx_status(ort_ReleaseAvailableProviders(names, n), "onnx: ReleaseAvailableProviders");
 }
 
+#ifdef __APPLE__
+extern *void dlsym(*void handle, string name);
+
+struct _OnnxCoreMLAppend {
+    fn(uint32)->*OrtStatus f;
+}
+
+// OrtSessionOptionsAppendExecutionProvider_CoreML, the way ONNX Runtime before 1.21 takes
+// Core ML (its provider list leaves it out on iOS), or null. RTLD_DEFAULT is -2 on Darwin.
+*void _onnx_coreml_fn() {
+    return dlsym((*void)(int64)-2, "OrtSessionOptionsAppendExecutionProvider_CoreML");
+}
+
+// The same options as Core ML flags (coreml_provider_factory.h).
+uint32 _onnx_coreml_flags(*OnnxOptions o) {
+    uint32 flags = 0;
+    if (o.coreml_format == null || strcmp(o.coreml_format, "MLProgram") == 0) flags |= 0x010;
+    if (o.coreml_units != null) {
+        if (strcmp(o.coreml_units, "CPUOnly") == 0) flags |= 0x001;
+        if (strcmp(o.coreml_units, "CPUAndGPU") == 0) flags |= 0x020;
+        if (strcmp(o.coreml_units, "CPUAndNeuralEngine") == 0) flags |= 0x004;
+    }
+    return flags;
+}
+#endif
+
 // True when this ONNX Runtime build has the provider (ONNX_COREML, ONNX_CUDA, ...).
 bool onnx_has_provider(int provider) {
     if (ort_api() == null) return false;
     if (provider == ONNX_CPU || provider == ONNX_AUTO) return true;
+#ifdef __APPLE__
+    if (provider == ONNX_COREML) return _onnx_has("CoreMLExecutionProvider") || _onnx_coreml_fn() != null;
+#else
     if (provider == ONNX_COREML) return _onnx_has("CoreMLExecutionProvider");
+#endif
     if (provider == ONNX_CUDA) return _onnx_has("CUDAExecutionProvider");
     if (provider == ONNX_DIRECTML) return _onnx_has("DmlExecutionProvider");
     if (provider == ONNX_WEBGPU) return _onnx_has("WebGpuExecutionProvider");
@@ -316,11 +347,23 @@ struct _OnnxDmlAppend {
 
 string _onnx_append_provider(*OrtSessionOptions so, *OnnxOptions o, int provider) {
     if (provider == ONNX_COREML) {
-        string[1] keys = {"MLComputeUnits"};
-        string[1] values = {"ALL"};
+        // MLProgram by default: with ONNX Runtime's NeuralNetwork default, the GPU and the
+        // Neural Engine compute in float16 and a YOLO model's outputs come out wrong.
+        string[2] keys = {"MLComputeUnits", "ModelFormat"};
+        string[2] values = {"ALL", "MLProgram"};
         if (o.coreml_units != null) values[0] = o.coreml_units;
-        return _onnx_status(ort_SessionOptionsAppendExecutionProvider(so, "CoreML", &keys[0], &values[0], 1),
+        if (o.coreml_format != null) values[1] = o.coreml_format;
+        string e = _onnx_status(ort_SessionOptionsAppendExecutionProvider(so, "CoreML", &keys[0], &values[0], 2),
             "onnx: CoreML");
+#ifdef __APPLE__
+        *void sym = _onnx_coreml_fn();
+        if (e != null && sym != null) {
+            _OrtRaw r = _OrtRaw{sym, (*void)so};
+            fn(uint32)->*OrtStatus append = ((*_OnnxCoreMLAppend)&r).f;
+            e = _onnx_status(append(_onnx_coreml_flags(o)), "onnx: CoreML");
+        }
+#endif
+        return e;
     }
     if (provider == ONNX_CUDA) {
         *OrtCUDAProviderOptionsV2 cuda = null;
@@ -527,8 +570,9 @@ Result<OnnxSession, string> _onnx_finish(*OrtSession handle, int provider) {
     return Ok<OnnxSession, string>(s);
 }
 
-// Loads a model file. opts may be null for the defaults (CPU).
-Result<OnnxSession, string> onnx_session(string path, *OnnxOptions opts) {
+// One attempt at a session from the file at `path`, or from data[0..len) when path is
+// null, with the options as given.
+Result<OnnxSession, string> _onnx_try(string path, *uint8 data, uint64 len, *OnnxOptions opts) {
     *OrtEnv env = onnx_env()?;
     *OrtSessionOptions so = null;
     string e = _onnx_status(ort_CreateSessionOptions(&so), "onnx: CreateSessionOptions");
@@ -538,33 +582,53 @@ Result<OnnxSession, string> onnx_session(string path, *OnnxOptions opts) {
     e = _onnx_set_options(so, opts, &provider);
     if (e != null) return Err<OnnxSession, string>(e);
     *OrtSession handle = null;
+    if (path == null) {
+        e = _onnx_status(ort_CreateSessionFromArray(env, (*void)data, len, so, &handle), "onnx: cannot load model");
+    } else {
 #ifdef _WIN32
-    int n = MultiByteToWideChar(65001, 0, path, -1, null, 0);
-    *uint16 wide = alloc<uint16>(n + 1);
-    MultiByteToWideChar(65001, 0, path, -1, wide, n);
-    e = _onnx_status(ort_CreateSession(env, wide, so, &handle), "onnx: cannot load model");
-    free(wide);
+        int n = MultiByteToWideChar(65001, 0, path, -1, null, 0);
+        *uint16 wide = alloc<uint16>(n + 1);
+        MultiByteToWideChar(65001, 0, path, -1, wide, n);
+        e = _onnx_status(ort_CreateSession(env, wide, so, &handle), "onnx: cannot load model");
+        free(wide);
 #else
-    e = _onnx_status(ort_CreateSession(env, (*ORTCHAR_T)path, so, &handle), "onnx: cannot load model");
+        e = _onnx_status(ort_CreateSession(env, (*ORTCHAR_T)path, so, &handle), "onnx: cannot load model");
 #endif
+    }
     if (e != null) return Err<OnnxSession, string>(e);
     return _onnx_finish(handle, provider);
 }
 
+// A session, retried when the provider cannot compile the model: Core ML in its older
+// NeuralNetwork format when the MLProgram default fails, then the CPU when the options
+// allow a fallback.
+Result<OnnxSession, string> _onnx_open(string path, *uint8 data, uint64 len, *OnnxOptions opts) {
+    Result<OnnxSession, string> r = _onnx_try(path, data, len, opts);
+    if (r.ok || opts == null) return r;
+    const int p = opts.provider == ONNX_AUTO ? _onnx_auto_provider() : opts.provider;
+    if (p == ONNX_COREML && opts.coreml_format == null) {
+        OnnxOptions nn = *opts;
+        nn.provider = ONNX_COREML;
+        nn.coreml_format = "NeuralNetwork";
+        r = _onnx_try(path, data, len, &nn);
+        if (r.ok) return r;
+    }
+    if (opts.fallback && p != ONNX_CPU) {
+        OnnxOptions cpu = *opts;
+        cpu.provider = ONNX_CPU;
+        return _onnx_try(path, data, len, &cpu);
+    }
+    return r;
+}
+
+// Loads a model file. opts may be null for the defaults (CPU).
+Result<OnnxSession, string> onnx_session(string path, *OnnxOptions opts) {
+    return _onnx_open(path, null, 0, opts);
+}
+
 // Loads a model from bytes in memory (the contents of a .onnx file).
 Result<OnnxSession, string> onnx_session_bytes(*uint8 data, uint64 len, *OnnxOptions opts) {
-    *OrtEnv env = onnx_env()?;
-    *OrtSessionOptions so = null;
-    string e = _onnx_status(ort_CreateSessionOptions(&so), "onnx: CreateSessionOptions");
-    if (e != null) return Err<OnnxSession, string>(e);
-    defer ort_ReleaseSessionOptions(so);
-    int provider = ONNX_CPU;
-    e = _onnx_set_options(so, opts, &provider);
-    if (e != null) return Err<OnnxSession, string>(e);
-    *OrtSession handle = null;
-    e = _onnx_status(ort_CreateSessionFromArray(env, (*void)data, len, so, &handle), "onnx: cannot load model");
-    if (e != null) return Err<OnnxSession, string>(e);
-    return _onnx_finish(handle, provider);
+    return _onnx_open(null, data, len, opts);
 }
 
 void OnnxSession_release(*OnnxSession self) {
