@@ -139,6 +139,9 @@ and DirectML the `Microsoft.ML.OnnxRuntime.DirectML` package.
 
 `threads` and `inter_threads` set the intra-op and inter-op thread pools (0 keeps ONNX
 Runtime's choice), `optimization` is `ONNX_OPT_NONE`, `_BASIC`, `_EXTENDED` or `_ALL`.
+`config` passes ONNX Runtime's session configuration entries as comma-separated
+`key=value` pairs (`"session.intra_op.allow_spinning=0"`); the environment variable
+`ONNX_CONFIG` adds entries to every session, before the options' own.
 
 ## Images
 
@@ -222,9 +225,45 @@ reflected borders, an area resize to 128x128, RGB in 0..1), and gives the same l
 the Python code to six decimals for faces larger than the model input. Model files are not
 part of this repository.
 
+## Platforms
+
+| Platform | ONNX Runtime | Checked |
+|---|---|---|
+| macOS arm64 | Homebrew or the `osx-arm64` release archive | CI |
+| Linux x86-64 | the `linux-x64` release archive | CI |
+| Windows x86-64 (MinGW) | the `win-x64` release archive | CI |
+| iOS (device and simulator) | the `onnxruntime-c` CocoaPods archive (1.30) | iOS simulator |
+| Android arm64 and x86_64 | the `onnxruntime-android` AAR | Android emulator (arm64) |
+
+ONNX Runtime ships for 64-bit targets only, so building `<onnx>` for a 32-bit target or for
+WebAssembly stops with an `#error` that says so. The package works with ONNX Runtime 1.16 or
+newer: it uses the library's own API version when that is older than the 31 it was
+generated from, and `ort_api_version()` says which one it got.
+
+**iOS.** ONNX Runtime comes as a static framework in
+`https://download.onnxruntime.ai/pod-archive-onnxruntime-c-1.30.0.zip`
+(`onnxruntime.xcframework`, with `ios-arm64` and `ios-arm64_x86_64-simulator` slices). Point
+`-L` at a directory with a `libonnxruntime.a` link to the slice's `onnxruntime` binary and
+add the frameworks it uses:
+
+```bash
+eskiuc app.esk --target arm64-apple-ios15.1-simulator -o app -L ort-ios \
+    --link-arg=-lc++ --link-arg=-framework --link-arg=CoreML --link-arg=-framework --link-arg=Foundation \
+    --link-arg=-framework --link-arg=UIKit --link-arg=-framework --link-arg=Network
+```
+
+For an app, build the Eskiu code as a static library (`-o libapp.a`) and let Xcode link it
+with the `onnxruntime-c` pod. The CPU and Core ML providers work there.
+
+**Android.** The `onnxruntime-android` AAR from Maven Central is a zip whose
+`jni/<abi>/libonnxruntime.so` is the library: `-L` that directory and ship the `.so` with
+the app (`LD_LIBRARY_PATH` when running a test binary through `adb`). On an emulator running
+on an Apple M4, ONNX Runtime's Arm kernels see SME in the reported CPU features but cannot
+run it in the virtual machine; set `ONNX_CONFIG=mlas.disable_kleidiai=1` there.
+
 ## Install
 
-The package needs ONNX Runtime 1.31 or newer (API version 31):
+The package needs ONNX Runtime 1.16 or newer; the instructions below use 1.31:
 
 ```bash
 brew install onnxruntime               # macOS
