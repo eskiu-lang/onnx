@@ -13,7 +13,17 @@ tmp=$(mktemp -d)
 trap 'rm -rf "$tmp"' EXIT
 "$cc" -I"$inc" "$root/tools/layout/layout.c" -o "$tmp/c"
 sed 's/^import <onnx\/raw>;//' "$root/tools/layout/layout.esk" > "$tmp/layout.esk"
-"$eskiuc" "$root/src/raw.esk" "$tmp/layout.esk" -o "$tmp/e" -L"$lib"
+case "$(uname -s)" in
+MINGW* | MSYS* | CYGWIN*)
+    # The program needs onnxruntime.dll beside it: Windows looks in System32,
+    # which may hold an older copy, before PATH.
+    cp "$lib"/*.dll "$tmp/"
+    "$eskiuc" "$root/src/raw.esk" "$tmp/layout.esk" -o "$tmp/e" -L"$lib"
+    ;;
+*)
+    "$eskiuc" "$root/src/raw.esk" "$tmp/layout.esk" -o "$tmp/e" -L"$lib" --link-arg=-Wl,-rpath,"$lib"
+    ;;
+esac
 "$tmp/c" > "$tmp/c.txt"
 "$tmp/e" > "$tmp/e.txt"
 diff "$tmp/c.txt" "$tmp/e.txt"
