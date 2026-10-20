@@ -1,0 +1,64 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <onnx>;
+
+// float16 tensors and the float16 conversions.
+
+Result<int, string> conversions() {
+    float[8] values = {0.0, 1.0, -2.5, 0.333333, 65504.0, 0.000061035156, 0.0000001, 100000.0};
+    uint16[8] bits = {0x0000, 0x3c00, 0xc100, 0x3555, 0x7bff, 0x0400, 0x0002, 0x7c00};
+    for (i in 0..8) {
+        uint16 h = onnx_f32_to_f16(values[i]);
+        if (h != bits[i]) {
+            printf("f16(%g) = %04x, want %04x\n", (double)values[i], (int)h, (int)bits[i]);
+            return Err<int, string>("f32 to f16");
+        }
+    }
+    for (i in 0..65536) {
+        uint16 h = (uint16)i;
+        uint32 e = ((uint32)h >> 10) & 0x1f;
+        if (e == 31 && ((uint32)h & 0x3ff) != 0) continue;
+        if (onnx_f32_to_f16(onnx_f16_to_f32(h)) != h) {
+            printf("round trip %04x\n", i);
+            return Err<int, string>("round trip");
+        }
+    }
+    if ((double)onnx_f16_to_f32(0x0001) * 16777216.0 != 1.0) return Err<int, string>("subnormal");
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    conversions()?;
+    OnnxSession s = onnx_session("tests/data/half.onnx", null)?;
+    defer s.release();
+    if (s.input(0).type != ONNX_FLOAT16 || s.output(0).type != ONNX_FLOAT16) return Err<int, string>("types");
+    int64 n = 0;
+    *uint16 x = (*uint16)fs_read_all("tests/data/half_x.bin", &n);
+    *uint16 want = (*uint16)fs_read_all("tests/data/half_y.bin", &n);
+    defer free(x);
+    defer free(want);
+    int64[2] shape = {2, 3};
+    OnnxTensor t = onnx_tensor_f16(x, &shape[0], 2)?;
+    defer t.release();
+    string[1] names = {"x"};
+    List<OnnxTensor> out = s.run(&names[0], &t, 1, null, 0)?;
+    defer onnx_tensors_free(&out);
+    *uint16 y = out.data[0].f16();
+    *float f = out.data[1].f32();
+    for (i in 0..6) {
+        if (y[i] != want[i]) return Err<int, string>("float16 output");
+        if (f[i] != onnx_f16_to_f32(x[i])) return Err<int, string>("cast to float");
+        if (out.data[0].at((uint64)i) != (double)onnx_f16_to_f32(want[i])) return Err<int, string>("at");
+    }
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}

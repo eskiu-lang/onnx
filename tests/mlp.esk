@@ -1,0 +1,49 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <onnx>;
+
+// MatMul + Add + Relu, checked against Python onnxruntime's output.
+
+*float load(string path) {
+    int64 n = 0;
+    return (*float)fs_read_all(path, &n);
+}
+
+Result<int, string> run() {
+    OnnxSession s = onnx_session("tests/data/mlp.onnx", null)?;
+    defer s.release();
+    if (s.input_count() != 1 || s.output_count() != 1) return Err<int, string>("counts");
+    *OnnxInfo in0 = s.input(0);
+    if (strcmp(in0.name.data, "x") != 0 || in0.type != ONNX_FLOAT || in0.shape.size != 2) return Err<int, string>("input info");
+    if (in0.shape.data[0] != 1 || in0.shape.data[1] != 4) return Err<int, string>("input shape");
+    if (strcmp(s.output(0).name.data, "y") != 0) return Err<int, string>("output name");
+    *float x = load("tests/data/mlp_x.bin");
+    *float want = load("tests/data/mlp_y.bin");
+    defer free(x);
+    defer free(want);
+    int64[2] shape = {1, 4};
+    OnnxTensor t = onnx_tensor_f32(x, &shape[0], 2)?;
+    defer t.release();
+    OnnxTensor y = s.run1(&t)?;
+    defer y.release();
+    if (y.type != ONNX_FLOAT || y.rank() != 2 || y.dim(0) != 1 || y.dim(1) != 3 || y.len() != 3) return Err<int, string>("output shape");
+    *float got = y.f32();
+    for (i in 0..3) {
+        float d = got[i] - want[i];
+        if (d > 0.00001 || d < -0.00001) {
+            printf("y[%d] = %f, want %f\n", i, (double)got[i], (double)want[i]);
+            return Err<int, string>("output values");
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}

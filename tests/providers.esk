@@ -1,0 +1,76 @@
+import <io>;
+import <mem>;
+import <string>;
+import <onnx>;
+
+// Execution providers: CPU always works; ONNX_AUTO picks what the build has
+// (CoreML on Apple); asking for a provider the build lacks is an error, or the
+// CPU with fallback set.
+
+Result<int, string> run_mlp(*OnnxOptions o, *int used) {
+    OnnxSession s = onnx_session("tests/data/conv.onnx", o)?;
+    defer s.release();
+    *used = s.provider;
+    int64[4] shape = {1, 1, 6, 6};
+    OnnxTensor t = onnx_tensor(ONNX_FLOAT, null, &shape[0], 4)?;
+    defer t.release();
+    OnnxTensor y = s.run1(&t)?;
+    defer y.release();
+    if (y.len() != 18) return Err<int, string>("output size");
+    return Ok<int, string>(0);
+}
+
+int main() {
+    String have;
+    onnx_providers(&have);
+    printf("ONNX Runtime %s, providers: %s\n", onnx_version(), (string)have.data);
+    String_free(&have);
+    if (!onnx_has_provider(ONNX_CPU)) return 1;
+
+    int used = -1;
+    OnnxOptions cpu = OnnxOptions{};
+    Result<int, string> r = run_mlp(&cpu, &used);
+    if (!r.ok || used != ONNX_CPU) {
+        printf("cpu: %s\n", r.ok ? "wrong provider" : r.error);
+        return 1;
+    }
+
+    OnnxOptions auto_ = OnnxOptions{provider: ONNX_AUTO};
+    r = run_mlp(&auto_, &used);
+    if (!r.ok) {
+        printf("auto: %s\n", r.error);
+        return 1;
+    }
+    printf("auto picked %s\n", onnx_provider_name(used));
+#ifdef __APPLE__
+    if (onnx_has_provider(ONNX_COREML)) {
+        if (used != ONNX_COREML) return 1;
+        OnnxOptions coreml = OnnxOptions{provider: ONNX_COREML, coreml_units: "CPUOnly"};
+        r = run_mlp(&coreml, &used);
+        if (!r.ok || used != ONNX_COREML) {
+            printf("coreml: %s\n", r.ok ? "wrong provider" : r.error);
+            return 1;
+        }
+    }
+#endif
+
+    int[3] wanted = {ONNX_COREML, ONNX_CUDA, ONNX_DIRECTML};
+    for (i in 0..3) {
+        int p = wanted[i];
+        if (onnx_has_provider(p)) continue;
+        OnnxOptions strict = OnnxOptions{provider: p};
+        r = run_mlp(&strict, &used);
+        if (r.ok || strstr(r.error, "has no") == null) {
+            printf("%s: wanted a missing-provider error, got %s\n", onnx_provider_name(p), r.ok ? "success" : r.error);
+            return 1;
+        }
+        printf("%s: %s\n", onnx_provider_name(p), r.error);
+        OnnxOptions loose = OnnxOptions{provider: p, fallback: true};
+        r = run_mlp(&loose, &used);
+        if (!r.ok || used != ONNX_CPU) {
+            printf("%s fallback: %s\n", onnx_provider_name(p), r.ok ? "wrong provider" : r.error);
+            return 1;
+        }
+    }
+    return 0;
+}

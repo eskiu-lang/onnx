@@ -1,0 +1,60 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <onnx>;
+
+// Conv + MaxPool on a 6x6 image, against Python onnxruntime. Also loads the
+// model from bytes in memory and with explicit options.
+
+*float load(string path) {
+    int64 n = 0;
+    return (*float)fs_read_all(path, &n);
+}
+
+Result<int, string> check(*OnnxSession s, *float x, *float want) {
+    int64[4] shape = {1, 1, 6, 6};
+    OnnxTensor t = onnx_tensor_f32(x, &shape[0], 4)?;
+    defer t.release();
+    OnnxTensor y = s.run1(&t)?;
+    defer y.release();
+    if (y.rank() != 4 || y.dim(1) != 2 || y.dim(2) != 3 || y.dim(3) != 3) return Err<int, string>("output shape");
+    *float got = y.f32();
+    for (i in 0..18) {
+        float d = got[i] - want[i];
+        if (d > 0.0001 || d < -0.0001) {
+            printf("y[%d] = %f, want %f\n", i, (double)got[i], (double)want[i]);
+            return Err<int, string>("output values");
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    *float x = load("tests/data/conv_x.bin");
+    *float want = load("tests/data/conv_y.bin");
+    defer free(x);
+    defer free(want);
+
+    OnnxOptions o = OnnxOptions{threads: 1, optimization: ONNX_OPT_NONE};
+    OnnxSession a = onnx_session("tests/data/conv.onnx", &o)?;
+    defer a.release();
+    check(&a, x, want)?;
+
+    int64 n = 0;
+    *uint8 bytes = fs_read_all("tests/data/conv.onnx", &n);
+    defer free(bytes);
+    OnnxOptions o2 = OnnxOptions{threads: 2, inter_threads: 1, optimization: ONNX_OPT_ALL};
+    OnnxSession b = onnx_session_bytes(bytes, (uint64)n, &o2)?;
+    defer b.release();
+    check(&b, x, want)?;
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}

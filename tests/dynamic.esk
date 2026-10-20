@@ -1,0 +1,59 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <onnx>;
+
+// A dynamic batch dimension: the same session runs batches of 5 and 2.
+
+*float load(string path) {
+    int64 n = 0;
+    return (*float)fs_read_all(path, &n);
+}
+
+bool near(float a, float b) {
+    float d = a - b;
+    return d < 0.00001 && d > -0.00001;
+}
+
+Result<int, string> run() {
+    OnnxSession s = onnx_session("tests/data/dynamic.onnx", null)?;
+    defer s.release();
+    *OnnxInfo x = s.input(0);
+    if (x.shape.size != 2 || x.shape.data[0] != -1 || x.shape.data[1] != 3) return Err<int, string>("input shape");
+    if (s.output(1).shape.size != 1 || s.output(1).shape.data[0] != -1) return Err<int, string>("output shape");
+    *float data = load("tests/data/dynamic_x.bin");
+    *float want_y = load("tests/data/dynamic_y.bin");
+    *float want_z = load("tests/data/dynamic_z.bin");
+    defer free(data);
+    defer free(want_y);
+    defer free(want_z);
+    for (b in 0..2) {
+        int64 batch = 5;
+        if (b == 1) batch = 2;
+        int64[2] shape = {batch, 3};
+        OnnxTensor t = onnx_tensor_f32(data, &shape[0], 2)?;
+        defer t.release();
+        string[1] names = {"x"};
+        List<OnnxTensor> out = s.run(&names[0], &t, 1, null, 0)?;
+        defer onnx_tensors_free(&out);
+        if (out.data[0].dim(0) != batch || out.data[1].dim(0) != batch) return Err<int, string>("batch");
+        *float y = out.data[0].f32();
+        *float z = out.data[1].f32();
+        for (i in 0..(int)batch * 3) {
+            if (!near(y[i], want_y[i])) return Err<int, string>("softmax");
+        }
+        for (i in 0..(int)batch) {
+            if (!near(z[i], want_z[i])) return Err<int, string>("sum");
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
