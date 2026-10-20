@@ -7,6 +7,8 @@ from fixed seeds, so running this again gives the same files. Inputs and outputs
 raw little-endian arrays (.bin) that the tests read with fs_read_all.
 """
 import os
+import struct
+import zlib
 
 import numpy as np
 import onnx
@@ -177,6 +179,25 @@ def colors():
         f.write("red\ngreen\nblue\ngray\n")
 
 
+def png(path, rgb):
+    h, w, _ = rgb.shape
+    rows = b"".join(b"\x00" + rgb[y].tobytes() for y in range(h))
+
+    def chunk(kind, data):
+        return struct.pack(">I", len(data)) + kind + data + struct.pack(">I", zlib.crc32(kind + data))
+    with open(path, "wb") as f:
+        f.write(b"\x89PNG\r\n\x1a\n" + chunk(b"IHDR", struct.pack(">IIBBBBB", w, h, 8, 2, 0, 0, 0)) +
+                chunk(b"IDAT", zlib.compress(rows, 9)) + chunk(b"IEND", b""))
+
+
+def sample():
+    # A 64x48 sky-blue gradient with a small orange square, for examples/classify.esk.
+    y, x = np.mgrid[0:48, 0:64]
+    rgb = np.stack([40 + x // 2, 90 + y, 200 + x // 3], axis=-1)
+    rgb[10:20, 40:52] = [240, 140, 30]
+    png(os.path.join(EXAMPLES, "sample.png"), np.clip(rgb, 0, 255).astype(np.uint8))
+
+
 def main():
     os.makedirs(DATA, exist_ok=True)
     os.makedirs(EXAMPLES, exist_ok=True)
@@ -188,6 +209,7 @@ def main():
     half()
     resize()
     colors()
+    sample()
     print("models written to tests/data and examples/data")
 
 

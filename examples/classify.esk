@@ -1,0 +1,159 @@
+// Image classification: the top five classes of an image.
+//
+//     eskiuc run -L/opt/homebrew/lib                          # the sample model and image
+//     eskiuc build -L/opt/homebrew/lib && build/onnx --model mobilenetv2-12.onnx --labels synset.txt cat.jpg
+//
+// The model takes one float image tensor [1, 3, H, W] normalized with the ImageNet
+// mean and standard deviation, as most ImageNet classifiers in the ONNX model zoo
+// do; H and W come from the model (224 when they are dynamic). The image (PNG or
+// JPEG) is cropped to its centered square and shrunk to H x W. --labels names a
+// text file with one class name per line. --provider picks cpu, auto, coreml,
+// cuda or directml.
+
+import <io>;
+import <mem>;
+import <fs>;
+import <string>;
+import <onnx>;
+import <math>;
+import <onnx/image>;
+import <gpu/image>;
+
+extern double exp(double x);
+
+struct Args {
+    string model = "examples/data/colors.onnx";
+    string labels = "examples/data/colors.txt";
+    string image = "examples/data/sample.png";
+    int provider;
+}
+
+int provider_named(string s) {
+    if (strcmp(s, "auto") == 0) return ONNX_AUTO;
+    if (strcmp(s, "coreml") == 0) return ONNX_COREML;
+    if (strcmp(s, "cuda") == 0) return ONNX_CUDA;
+    if (strcmp(s, "directml") == 0) return ONNX_DIRECTML;
+    return ONNX_CPU;
+}
+
+// The label file's lines; an empty list when there is none.
+List<String> read_labels(string path) {
+    List<String> out;
+    int64 n = 0;
+    *uint8 text = fs_read_all(path, &n);
+    if (text == null) return out;
+    defer free(text);
+    String line;
+    for (i in 0..n) {
+        if (text[i] == 10) {
+            List_push(&out, line);
+            line = String{};
+        } else if (text[i] != 13) {
+            String_appendf(&line, "%c", (int)text[i]);
+        }
+    }
+    if (line.len > 0) List_push(&out, line);
+    return out;
+}
+
+Result<int, string> classify(*Args a) {
+    OnnxOptions opts = OnnxOptions{provider: a.provider, fallback: true};
+    OnnxSession s = onnx_session(a.model, &opts)?;
+    defer s.release();
+    *OnnxInfo in0 = s.input(0);
+    if (in0.type != ONNX_FLOAT || in0.shape.size != 4 || in0.shape.data[1] != 3) return Err<int, string>("the model does not take a [1, 3, H, W] float image");
+    int h = (int)in0.shape.data[2];
+    int w = (int)in0.shape.data[3];
+    if (h <= 0) h = 224;
+    if (w <= 0) w = 224;
+
+    Image img = image_load(a.image)?;
+    defer img.free();
+    int iw = (int)img.width;
+    int ih = (int)img.height;
+    int side = iw;
+    if (ih < side) side = ih;
+    *uint8 square = onnx_image_crop(img.rgba, iw, ih, (iw - side) / 2, (ih - side) / 2, side, side, ONNX_BORDER_CLAMP);
+    defer free(square);
+    *uint8 small = onnx_image_resize_area(square, side, side, w, h);
+    defer free(small);
+    OnnxImageFormat f = onnx_format_imagenet();
+    OnnxTensor x = onnx_image_tensor(small, w, h, &f)?;
+    defer x.release();
+    OnnxTensor y = s.run1(&x)?;
+    defer y.release();
+
+    // Turn logits into probabilities unless the model already did.
+    uint64 n = y.len();
+    *double p = alloc<double>((int)n);
+    defer free(p);
+    double sum = 0.0;
+    bool probs = true;
+    for (i in 0..n) {
+        p[i] = y.at(i);
+        sum += p[i];
+        if (p[i] < 0.0) probs = false;
+    }
+    if (!probs || sum < 0.99 || sum > 1.01) {
+        double top = p[y.argmax()];
+        sum = 0.0;
+        for (i in 0..n) {
+            p[i] = exp(p[i] - top);
+            sum += p[i];
+        }
+        for (i in 0..n) p[i] = p[i] / sum;
+    }
+
+    List<String> labels = read_labels(a.labels);
+    defer {
+        for (i in 0..labels.size) String_free(&labels.data[i]);
+        List_free(&labels);
+    }
+    printf("%s on %s (%s), %dx%d input\n", a.model, a.image, onnx_provider_name(s.provider), w, h);
+    for (k in 0..5) {
+        if ((uint64)k >= n) break;
+        uint64 best = 0;
+        for (i in 1..n) {
+            if (p[i] > p[best]) best = i;
+        }
+        if (p[best] < 0.0) break;
+        if (best < (uint64)labels.size) printf("%6.2f%%  %s\n", p[best] * 100.0, labels.data[best].data);
+        else printf("%6.2f%%  class %d\n", p[best] * 100.0, (int)best);
+        p[best] = -1.0;
+    }
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    Args a;
+    bool custom_model = false;
+    bool custom_labels = false;
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "--model") == 0 && i + 1 < argc) {
+            a.model = argv[i + 1];
+            custom_model = true;
+            i += 2;
+        } else if (strcmp(argv[i], "--labels") == 0 && i + 1 < argc) {
+            a.labels = argv[i + 1];
+            custom_labels = true;
+            i += 2;
+        } else if (strcmp(argv[i], "--provider") == 0 && i + 1 < argc) {
+            a.provider = provider_named(argv[i + 1]);
+            i += 2;
+        } else if (argv[i][0] == '-') {
+            printf("usage: classify [--model M.onnx] [--labels L.txt] [--provider cpu|auto|coreml|cuda|directml] [IMAGE]\n");
+            return 2;
+        } else {
+            a.image = argv[i];
+            i++;
+        }
+    }
+    if (custom_model && !custom_labels) a.labels = "";
+    Result<int, string> r = classify(&a);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
