@@ -1,0 +1,93 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  ORT_VERSION: 1.31.0
+
+jobs:
+  linux:
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu and ONNX Runtime
+        run: |
+          curl -fsSL https://eskiu-lang.org/install.sh | ESKIU_PREFIX=$HOME/.eskiu sh
+          echo "$HOME/.eskiu/bin" >> $GITHUB_PATH
+          curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-linux-x64-$ORT_VERSION.tgz | tar xz -C $HOME
+          echo "ORT=$HOME/onnxruntime-linux-x64-$ORT_VERSION" >> $GITHUB_ENV
+      - name: Layout check
+        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $ORT/lib
+      - name: Tests
+        run: eskiuc test -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib
+      - name: Examples
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib "$f" -o build/$(basename "$f" .esk); done
+          build/classify | tee build/classify.txt
+          grep -q "blue" build/classify.txt
+
+  macos:
+    runs-on: macos-15
+    steps:
+      - uses: actions/checkout@v4
+      - name: Install Eskiu and ONNX Runtime
+        run: |
+          brew install eskiu-lang/eskiu/eskiu
+          curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz | tar xz -C $HOME
+          echo "ORT=$HOME/onnxruntime-osx-arm64-$ORT_VERSION" >> $GITHUB_ENV
+      - name: Layout check
+        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $ORT/lib
+      - name: Tests
+        run: eskiuc test -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib
+      - name: Examples
+        run: |
+          mkdir -p build
+          for f in examples/*.esk; do eskiuc -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib "$f" -o build/$(basename "$f" .esk); done
+          build/classify --provider auto | tee build/classify.txt
+          grep -q "blue" build/classify.txt
+
+  windows:
+    runs-on: windows-latest
+    defaults:
+      run:
+        shell: msys2 {0}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: msys2/setup-msys2@v2
+        with:
+          msystem: MINGW64
+          install: mingw-w64-x86_64-gcc unzip diffutils
+      - name: Install Eskiu and ONNX Runtime
+        run: |
+          curl -fsSL -o eskiu.zip https://github.com/eskiu-lang/eskiu/releases/latest/download/eskiuc-windows-x86_64.zip
+          # The archive's paths use backslashes; unzip extracts it and exits with 1 (a warning).
+          unzip -q eskiu.zip -d $HOME/eskiu || [ $? -eq 1 ]
+          test -x $HOME/eskiu/bin/eskiuc.exe
+          curl -fsSL -o ort.zip https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-win-x64-$ORT_VERSION.zip
+          # Leave out the 400 MB of debug symbols.
+          unzip -q ort.zip "*/include/*" "*/lib/*.dll" -d $HOME
+          # MinGW links against the DLL itself, kept alone in its own directory.
+          mkdir -p $HOME/ort-link
+          cp $HOME/onnxruntime-win-x64-$ORT_VERSION/lib/onnxruntime.dll $HOME/ort-link/
+      - name: Layout check
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          ORT=$HOME/onnxruntime-win-x64-$ORT_VERSION
+          CC=gcc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $HOME/ort-link
+      - name: Tests
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          # Windows loads the DLL beside the program first; System32 can hold an older onnxruntime.dll.
+          mkdir -p build/tests
+          cp $HOME/onnxruntime-win-x64-$ORT_VERSION/lib/*.dll build/tests/
+          CC=gcc eskiuc test -L$HOME/ort-link
+      - name: Examples
+        run: |
+          export PATH="$HOME/eskiu/bin:$PATH"
+          cp $HOME/onnxruntime-win-x64-$ORT_VERSION/lib/*.dll build/
+          for f in examples/*.esk; do CC=gcc eskiuc -L$HOME/ort-link "$f" -o build/$(basename "$f" .esk).exe; done
+          build/classify.exe | tee build/classify.txt
+          grep -q "blue" build/classify.txt
