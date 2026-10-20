@@ -22,6 +22,7 @@ import <mem>;
 import <string>;
 import <list>;
 import <result>;
+import <env>;
 import <onnx/raw>;
 
 #ifdef _WIN32
@@ -69,6 +70,10 @@ struct OnnxOptions {
     int device;
     bool fallback;
     string coreml_units;
+    // ONNX Runtime session configuration entries, "key=value" pairs separated by
+    // commas (AddSessionConfigEntry), e.g. "mlas.disable_kleidiai=1". The
+    // environment variable ONNX_CONFIG adds entries to every session.
+    string config;
 }
 
 // One model input or output: its name, element type and shape (-1 for a
@@ -134,7 +139,7 @@ Result<*OrtEnv, string> onnx_env() {
     if (ort_api() == null) {
         String_clear(&_onnx_err);
         String_appendf(&_onnx_err, "onnx: ONNX Runtime %s does not provide API version %d (1.%d or newer is needed)",
-            ort_version_string(), (int)ORT_API_VERSION, (int)ORT_API_VERSION);
+            ort_version_string(), (int)ORT_API_MIN_VERSION, (int)ORT_API_MIN_VERSION);
         return Err<*OrtEnv, string>(_onnx_err.data);
     }
     *OrtEnv env = null;
@@ -343,10 +348,44 @@ int _onnx_auto_provider() {
     return ONNX_CPU;
 }
 
+// Each "key=value" of a comma-separated list as a session configuration entry.
+string _onnx_config_entries(*OrtSessionOptions so, string list) {
+    if (list == null) return null;
+    String key;
+    String value;
+    key.init(32);
+    value.init(32);
+    defer key.free();
+    defer value.free();
+    int64 i = 0;
+    while (list[i] != 0) {
+        key.clear();
+        value.clear();
+        while (list[i] != 0 && list[i] != '=' && list[i] != ',') {
+            key.push(list[i]);
+            i++;
+        }
+        if (list[i] != '=') return _onnx_fail("onnx: a config entry needs key=value", null);
+        i++;
+        while (list[i] != 0 && list[i] != ',') {
+            value.push(list[i]);
+            i++;
+        }
+        if (list[i] == ',') i++;
+        string e = _onnx_status(ort_AddSessionConfigEntry(so, key.data, value.data), "onnx: AddSessionConfigEntry");
+        if (e != null) return e;
+    }
+    return null;
+}
+
 string _onnx_set_options(*OrtSessionOptions so, *OnnxOptions o, *int used) {
     *used = ONNX_CPU;
+    // $ONNX_CONFIG adds entries to every session, before the options' own.
+    string e = _onnx_config_entries(so, getenv("ONNX_CONFIG"));
+    if (e != null) return e;
     if (o == null) return null;
-    string e = null;
+    e = _onnx_config_entries(so, o.config);
+    if (e != null) return e;
     if (o.threads > 0) {
         e = _onnx_status(ort_SetIntraOpNumThreads(so, o.threads), "onnx: SetIntraOpNumThreads");
         if (e != null) return e;

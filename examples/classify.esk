@@ -26,6 +26,7 @@ struct Args {
     string labels = "examples/data/colors.txt";
     string image = "examples/data/sample.png";
     int provider;
+    string config;
 }
 
 int provider_named(string s) {
@@ -58,7 +59,7 @@ List<String> read_labels(string path) {
 }
 
 Result<int, string> classify(*Args a) {
-    OnnxOptions opts = OnnxOptions{provider: a.provider, fallback: true};
+    OnnxOptions opts = OnnxOptions{provider: a.provider, fallback: true, config: a.config};
     OnnxSession s = onnx_session(a.model, &opts)?;
     defer s.release();
     *OnnxInfo in0 = s.input(0);
@@ -142,8 +143,11 @@ int main(int argc, string* argv) {
         } else if (strcmp(argv[i], "--provider") == 0 && i + 1 < argc) {
             a.provider = provider_named(argv[i + 1]);
             i += 2;
+        } else if (strcmp(argv[i], "--config") == 0 && i + 1 < argc) {
+            a.config = argv[i + 1];
+            i += 2;
         } else if (argv[i][0] == '-') {
-            printf("usage: classify [--model M.onnx] [--labels L.txt] [--provider cpu|auto|coreml|cuda|directml|webgpu] [IMAGE]\n");
+            printf("usage: classify [--model M.onnx] [--labels L.txt] [--provider cpu|auto|coreml|cuda|directml|webgpu] [--config key=value,...] [IMAGE]\n");
             return 2;
         } else {
             a.image = argv[i];
