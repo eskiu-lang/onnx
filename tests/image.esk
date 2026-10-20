@@ -1,0 +1,180 @@
+import <io>;
+import <mem>;
+import <onnx>;
+import <onnx/image>;
+
+// <onnx/image>: bilinear resize against ONNX Resize run by ONNX Runtime, area
+// resize, crops with each border mode and the tensor layouts.
+
+*uint8 pattern(int w, int h) {
+    *uint8 p = alloc<uint8>((int64)w * (int64)h * 4);
+    uint32 s = 12345;
+    for (i in 0..w * h * 4) {
+        s = s * 1103515245 + 12345;
+        p[i] = (uint8)((s >> 16) & 255);
+    }
+    return p;
+}
+
+// ONNX Resize (linear, half_pixel) over the image's four channels as floats.
+Result<OnnxTensor, string> reference(*OnnxSession s, *uint8 img, int w, int h, int nw, int nh) {
+    int64[4] shape = {1, 4, (int64)h, (int64)w};
+    OnnxTensor x = onnx_tensor(ONNX_FLOAT, null, &shape[0], 4)?;
+    defer x.release();
+    *float xf = x.f32();
+    for (c in 0..4) {
+        for (p in 0..w * h) xf[c * w * h + p] = (float)img[p * 4 + c];
+    }
+    int64[4] sizes = {1, 4, (int64)nh, (int64)nw};
+    int64[1] sizes_shape = {4};
+    OnnxTensor sz = onnx_tensor_i64(&sizes[0], &sizes_shape[0], 1)?;
+    defer sz.release();
+    string[2] names = {"x", "sizes"};
+    OnnxTensor[2] inputs = {x, sz};
+    List<OnnxTensor> out = s.run(&names[0], &inputs[0], 2, null, 0)?;
+    OnnxTensor y = out.data[0];
+    List_free(&out);
+    return Ok<OnnxTensor, string>(y);
+}
+
+Result<int, string> resize(*OnnxSession s, int w, int h, int nw, int nh) {
+    *uint8 img = pattern(w, h);
+    defer free(img);
+    *uint8 ours = onnx_image_resize(img, w, h, nw, nh);
+    defer free(ours);
+    OnnxTensor want = reference(s, img, w, h, nw, nh)?;
+    defer want.release();
+    *float wf = want.f32();
+    for (c in 0..4) {
+        for (p in 0..nw * nh) {
+            float d = (float)ours[p * 4 + c] - wf[c * nw * nh + p];
+            if (d > 0.501 || d < -0.501) {
+                printf("%dx%d -> %dx%d: pixel %d channel %d is %d, ONNX Resize gives %f\n", w, h, nw, nh, p, c,
+                    (int)ours[p * 4 + c], (double)wf[c * nw * nh + p]);
+                return Err<int, string>("bilinear resize");
+            }
+        }
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> area() {
+    int w = 40;
+    int h = 20;
+    *uint8 img = pattern(w, h);
+    defer free(img);
+    *uint8 out = onnx_image_resize_area(img, w, h, 10, 5);
+    defer free(out);
+    for (j in 0..5) {
+        for (i in 0..10) {
+            for (k in 0..4) {
+                int sum = 0;
+                for (dy in 0..4) {
+                    for (dx in 0..4) sum += (int)img[((j * 4 + dy) * w + i * 4 + dx) * 4 + k];
+                }
+                int want = (sum * 2 + 16) / 32;
+                int got = (int)out[(j * 10 + i) * 4 + k];
+                if (got - want > 1 || want - got > 1) return Err<int, string>("area resize");
+            }
+        }
+    }
+    // A non-integer ratio keeps the mean of a constant image.
+    *uint8 flat = alloc<uint8>(31 * 17 * 4);
+    defer free(flat);
+    memset(flat, 77, 31 * 17 * 4);
+    *uint8 small = onnx_image_resize_area(flat, 31, 17, 9, 7);
+    defer free(small);
+    for (i in 0..9 * 7 * 4) {
+        if (small[i] != 77) return Err<int, string>("area resize of a flat image");
+    }
+    return Ok<int, string>(0);
+}
+
+Result<int, string> crops() {
+    // A 3x1 image with red values 10, 20, 30.
+    uint8[12] img = {10, 0, 0, 255, 20, 0, 0, 255, 30, 0, 0, 255};
+    int[3] modes = {ONNX_BORDER_ZERO, ONNX_BORDER_CLAMP, ONNX_BORDER_REFLECT};
+    int[21] want = {0, 0, 10, 20, 30, 0, 0, 10, 10, 10, 20, 30, 30, 30, 30, 20, 10, 20, 30, 20, 10};
+    for (m in 0..3) {
+        *uint8 c = onnx_image_crop(&img[0], 3, 1, -2, 0, 7, 1, modes[m]);
+        for (i in 0..7) {
+            if ((int)c[i * 4] != want[m * 7 + i]) {
+                free(c);
+                return Err<int, string>("crop border");
+            }
+        }
+        free(c);
+    }
+    *uint8 big = pattern(9, 7);
+    defer free(big);
+    *uint8 inner = onnx_image_crop(big, 9, 7, 2, 3, 4, 2, ONNX_BORDER_ZERO);
+    defer free(inner);
+    for (j in 0..2) {
+        for (i in 0..16) {
+            if (inner[j * 16 + i] != big[((3 + j) * 9 + 2) * 4 + i]) return Err<int, string>("inner crop");
+        }
+    }
+    if (onnx_image_crop(big, 9, 7, 0, 0, 0, 3, ONNX_BORDER_ZERO) != null) return Err<int, string>("empty crop");
+    return Ok<int, string>(0);
+}
+
+bool near(float a, float b) {
+    float d = a - b;
+    return d < 0.0001 && d > -0.0001;
+}
+
+Result<int, string> tensors() {
+    // 2x1 image: (255, 0, 51) and (0, 102, 255).
+    uint8[8] img = {255, 0, 51, 255, 0, 102, 255, 255};
+    OnnxImageFormat unit = onnx_format_unit();
+    OnnxTensor a = onnx_image_tensor(&img[0], 2, 1, &unit)?;
+    defer a.release();
+    if (a.dim(0) != 1 || a.dim(1) != 3 || a.dim(2) != 1 || a.dim(3) != 2) return Err<int, string>("NCHW shape");
+    float[6] nchw = {1.0, 0.0, 0.0, 0.4, 0.2, 1.0};
+    for (i in 0..6) {
+        if (!near(a.f32()[i], nchw[i])) return Err<int, string>("NCHW values");
+    }
+    OnnxImageFormat bgr = OnnxImageFormat{nhwc: true, bgr: true};
+    OnnxTensor b = onnx_image_tensor(&img[0], 2, 1, &bgr)?;
+    defer b.release();
+    if (b.dim(1) != 1 || b.dim(2) != 2 || b.dim(3) != 3) return Err<int, string>("NHWC shape");
+    float[6] nhwc = {51.0, 0.0, 255.0, 255.0, 102.0, 0.0};
+    for (i in 0..6) {
+        if (b.f32()[i] != nhwc[i]) return Err<int, string>("NHWC BGR values");
+    }
+    OnnxImageFormat net = onnx_format_imagenet();
+    OnnxTensor c = onnx_image_tensor(&img[0], 2, 1, &net)?;
+    defer c.release();
+    if (!near(c.f32()[0], (1.0 - 0.485) / 0.229) || !near(c.f32()[5], (1.0 - 0.406) / 0.225)) return Err<int, string>("imagenet values");
+    int64[4] shape = {2, 3, 1, 2};
+    OnnxTensor h = onnx_tensor(ONNX_FLOAT16, null, &shape[0], 4)?;
+    defer h.release();
+    onnx_image_into(&img[0], 2, 1, &unit, &h, 1)?;
+    if (h.f16()[0] != 0 || h.f16()[6] != onnx_f32_to_f16(1.0)) return Err<int, string>("float16 batch item");
+    Result<int, string> bad = onnx_image_into(&img[0], 2, 1, &unit, &h, 2);
+    if (bad.ok) return Err<int, string>("index out of range accepted");
+    return Ok<int, string>(0);
+}
+
+Result<int, string> run() {
+    OnnxSession s = onnx_session("tests/data/resize.onnx", null)?;
+    defer s.release();
+    resize(&s, 37, 23, 64, 48)?;
+    resize(&s, 37, 23, 16, 10)?;
+    resize(&s, 5, 5, 5, 5)?;
+    resize(&s, 1, 1, 3, 2)?;
+    resize(&s, 64, 64, 17, 30)?;
+    area()?;
+    crops()?;
+    tensors()?;
+    return Ok<int, string>(0);
+}
+
+int main() {
+    Result<int, string> r = run();
+    if (!r.ok) {
+        printf("FAIL: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
