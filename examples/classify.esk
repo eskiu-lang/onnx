@@ -8,7 +8,7 @@
 // do; H and W come from the model (224 when they are dynamic). The image (PNG or
 // JPEG) is cropped to its centered square and shrunk to H x W. --labels names a
 // text file with one class name per line. --provider picks cpu, auto, coreml,
-// cuda or directml.
+// cuda, directml or webgpu.
 
 import <io>;
 import <mem>;
@@ -33,6 +33,7 @@ int provider_named(string s) {
     if (strcmp(s, "coreml") == 0) return ONNX_COREML;
     if (strcmp(s, "cuda") == 0) return ONNX_CUDA;
     if (strcmp(s, "directml") == 0) return ONNX_DIRECTML;
+    if (strcmp(s, "webgpu") == 0) return ONNX_WEBGPU;
     return ONNX_CPU;
 }
 
@@ -142,7 +143,7 @@ int main(int argc, string* argv) {
             a.provider = provider_named(argv[i + 1]);
             i += 2;
         } else if (argv[i][0] == '-') {
-            printf("usage: classify [--model M.onnx] [--labels L.txt] [--provider cpu|auto|coreml|cuda|directml] [IMAGE]\n");
+            printf("usage: classify [--model M.onnx] [--labels L.txt] [--provider cpu|auto|coreml|cuda|directml|webgpu] [IMAGE]\n");
             return 2;
         } else {
             a.image = argv[i];

@@ -53,9 +53,18 @@ int main() {
         }
     }
 #endif
+    if (onnx_has_provider(ONNX_WEBGPU)) {
+        OnnxOptions webgpu = OnnxOptions{provider: ONNX_WEBGPU};
+        r = run_mlp(&webgpu, &used);
+        if (!r.ok || used != ONNX_WEBGPU) {
+            printf("webgpu: %s\n", r.ok ? "wrong provider" : r.error);
+            return 1;
+        }
+        printf("WebGPU ran\n");
+    }
 
-    int[3] wanted = {ONNX_COREML, ONNX_CUDA, ONNX_DIRECTML};
-    for (i in 0..3) {
+    int[4] wanted = {ONNX_COREML, ONNX_CUDA, ONNX_DIRECTML, ONNX_WEBGPU};
+    for (i in 0..4) {
         int p = wanted[i];
         if (onnx_has_provider(p)) continue;
         OnnxOptions strict = OnnxOptions{provider: p};

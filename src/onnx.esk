@@ -51,6 +51,7 @@ const int ONNX_AUTO = 1;
 const int ONNX_COREML = 2;
 const int ONNX_CUDA = 3;
 const int ONNX_DIRECTML = 4;
+const int ONNX_WEBGPU = 5;
 
 // Graph optimization levels for OnnxOptions.optimization.
 const int ONNX_OPT_DEFAULT = 0;
@@ -271,16 +272,18 @@ bool onnx_has_provider(int provider) {
     if (provider == ONNX_COREML) return _onnx_has("CoreMLExecutionProvider");
     if (provider == ONNX_CUDA) return _onnx_has("CUDAExecutionProvider");
     if (provider == ONNX_DIRECTML) return _onnx_has("DmlExecutionProvider");
+    if (provider == ONNX_WEBGPU) return _onnx_has("WebGpuExecutionProvider");
     return false;
 }
 
-// The name of a provider constant ("CPU", "CoreML", "CUDA", "DirectML").
+// The name of a provider constant ("CPU", "CoreML", "CUDA", "DirectML", "WebGPU").
 string onnx_provider_name(int provider) {
     if (provider == ONNX_CPU) return "CPU";
     if (provider == ONNX_AUTO) return "auto";
     if (provider == ONNX_COREML) return "CoreML";
     if (provider == ONNX_CUDA) return "CUDA";
     if (provider == ONNX_DIRECTML) return "DirectML";
+    if (provider == ONNX_WEBGPU) return "WebGPU";
     return "unknown";
 }
 
@@ -310,6 +313,7 @@ string _onnx_append_provider(*OrtSessionOptions so, *OnnxOptions o, int provider
         if (e != null) return e;
         return _onnx_status(ort_SessionOptionsAppendExecutionProvider_CUDA_V2(so, cuda), "onnx: CUDA");
     }
+    if (provider == ONNX_WEBGPU) return _onnx_status(ort_SessionOptionsAppendExecutionProvider(so, "WebGPU", null, null, 0), "onnx: WebGPU");
     if (provider == ONNX_DIRECTML) {
         // The DirectML provider wants sequential execution and no memory patterns.
         string e = _onnx_status(ort_SetSessionExecutionMode(so, ORT_SEQUENTIAL), "onnx: DirectML");
@@ -362,7 +366,7 @@ string _onnx_set_options(*OrtSessionOptions so, *OnnxOptions o, *int used) {
     int p = o.provider;
     if (p == ONNX_AUTO) p = _onnx_auto_provider();
     if (p == ONNX_CPU) return null;
-    if (p != ONNX_COREML && p != ONNX_CUDA && p != ONNX_DIRECTML) return _onnx_fail("onnx: unknown provider", null);
+    if (p != ONNX_COREML && p != ONNX_CUDA && p != ONNX_DIRECTML && p != ONNX_WEBGPU) return _onnx_fail("onnx: unknown provider", null);
     if (!onnx_has_provider(p)) {
         if (o.fallback) return null;
         String have;
