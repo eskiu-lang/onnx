@@ -1,0 +1,142 @@
+// Face anti-spoofing with MiniFASNet: is the face in a photo a live person, or a
+// printed photo or a screen held up to the camera?
+//
+//     minifasnet MODEL IMAGE [X1 Y1 X2 Y2] [--expand F] [--threshold P] [--provider auto]
+//
+// MODEL is a MiniFASNet export that takes a [N, 3, 128, 128] RGB image in 0..1 and
+// gives two logits, real and spoof, such as best_model.onnx from
+// https://github.com/facenox/face-antispoof-onnx (Apache-2.0; MiniFASNetV2-SE after
+// Minivision's Silent-Face-Anti-Spoofing):
+//
+//     curl -LO https://raw.githubusercontent.com/facenox/face-antispoof-onnx/main/models/best/98.20/best_model.onnx
+//
+// X1 Y1 X2 Y2 is the face's box from a face detector, in pixels. The crop is the
+// square around the box's center, F times its longer side (1.5 by default, as the
+// model was trained), with the image reflected where the square leaves it. Without
+// a box the whole image is taken as the face crop. The steps follow the project's
+// Python preprocessing; a crop smaller than 128 pixels is enlarged with bilinear
+// filtering where the Python code uses Lanczos, so its logits can differ slightly.
+
+import <io>;
+import <mem>;
+import <math>;
+import <onnx>;
+import <onnx/image>;
+import <gpu/image>;
+
+extern double exp(double x);
+extern double log(double x);
+extern double atof(string s);
+extern int atoi(string s);
+
+struct Face {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+    double expand = 1.5;
+    double threshold = 0.5;
+    int provider;
+}
+
+// The 128x128 RGBA crop the model sees.
+*uint8 face_crop(*Image img, *Face f) {
+    int iw = (int)img.width;
+    int ih = (int)img.height;
+    int w = f.x2 - f.x1;
+    int h = f.y2 - f.y1;
+    if (w <= 0 || h <= 0) return null;
+    int m = w;
+    if (h > m) m = h;
+    double cx = (double)f.x1 + (double)w / 2.0;
+    double cy = (double)f.y1 + (double)h / 2.0;
+    int x = (int)(cx - (double)m * f.expand / 2.0);
+    int y = (int)(cy - (double)m * f.expand / 2.0);
+    int size = (int)((double)m * f.expand);
+    if (size <= 0) return null;
+    *uint8 square = onnx_image_crop(img.rgba, iw, ih, x, y, size, size, ONNX_BORDER_REFLECT);
+    defer free(square);
+    double ratio = 128.0 / (double)size;
+    int scaled = (int)((double)size * ratio);
+    *uint8 small = null;
+    if (ratio > 1.0) small = onnx_image_resize(square, size, size, scaled, scaled);
+    else small = onnx_image_resize_area(square, size, size, scaled, scaled);
+    defer free(small);
+    int pad = (128 - scaled) / 2;
+    return onnx_image_crop(small, scaled, scaled, -pad, -pad, 128, 128, ONNX_BORDER_REFLECT);
+}
+
+Result<int, string> check(string model, string path, *Face f) {
+    OnnxOptions opts = OnnxOptions{provider: f.provider, fallback: true};
+    OnnxSession s = onnx_session(model, &opts)?;
+    defer s.release();
+    Image img = image_load(path)?;
+    defer img.free();
+    if (f.x2 == 0 && f.y2 == 0) {
+        f.x2 = (int)img.width;
+        f.y2 = (int)img.height;
+        f.expand = 1.0;
+    }
+    *uint8 crop = face_crop(&img, f);
+    if (crop == null) return Err<int, string>("the face box is empty");
+    defer free(crop);
+    OnnxImageFormat unit = onnx_format_unit();
+    OnnxTensor x = onnx_image_tensor(crop, 128, 128, &unit)?;
+    defer x.release();
+    OnnxTensor y = s.run1(&x)?;
+    defer y.release();
+    if (y.len() != 2) return Err<int, string>("the model does not give two logits");
+    double real = y.at(0);
+    double spoof = y.at(1);
+    double diff = real - spoof;
+    double p = f.threshold;
+    if (p < 0.000001) p = 0.000001;
+    if (p > 0.999999) p = 0.999999;
+    double cut = log(p / (1.0 - p));
+    double live = 1.0 / (1.0 + exp(-diff));
+    printf("box %d %d %d %d, logits real %.6f spoof %.6f\n", f.x1, f.y1, f.x2, f.y2, real, spoof);
+    printf("%s (live %.2f%%, %s)\n", diff >= cut ? "real" : "spoof", live * 100.0, onnx_provider_name(s.provider));
+    return Ok<int, string>(0);
+}
+
+int main(int argc, string* argv) {
+    Face f;
+    string[6] pos;
+    int npos = 0;
+    int i = 1;
+    while (i < argc) {
+        if (strcmp(argv[i], "--expand") == 0 && i + 1 < argc) {
+            f.expand = atof(argv[i + 1]);
+            i += 2;
+        } else if (strcmp(argv[i], "--threshold") == 0 && i + 1 < argc) {
+            f.threshold = atof(argv[i + 1]);
+            i += 2;
+        } else if (strcmp(argv[i], "--provider") == 0 && i + 1 < argc) {
+            if (strcmp(argv[i + 1], "auto") == 0) f.provider = ONNX_AUTO;
+            i += 2;
+        } else if (npos < 6) {
+            pos[npos] = argv[i];
+            npos++;
+            i++;
+        } else {
+            npos = 7;
+            break;
+        }
+    }
+    if (npos != 2 && npos != 6) {
+        printf("usage: minifasnet MODEL IMAGE [X1 Y1 X2 Y2] [--expand F] [--threshold P] [--provider auto]\n");
+        return 2;
+    }
+    if (npos == 6) {
+        f.x1 = atoi(pos[2]);
+        f.y1 = atoi(pos[3]);
+        f.x2 = atoi(pos[4]);
+        f.y2 = atoi(pos[5]);
+    }
+    Result<int, string> r = check(pos[0], pos[1], &f);
+    if (!r.ok) {
+        printf("error: %s\n", r.error);
+        return 1;
+    }
+    return 0;
+}
