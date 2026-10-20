@@ -1,0 +1,27 @@
+import <io>;
+import <mem>;
+import <string>;
+import <onnx>;
+
+// Custom metadata: a present key reads back, a missing one is false.
+
+int main() {
+    Result<OnnxSession, string> s = onnx_session("tests/data/multi.onnx", null);
+    if (!s.ok) {
+        printf("FAIL: %s\n", s.error);
+        return 1;
+    }
+    defer s.value.release();
+    String v;
+    defer String_free(&v);
+    if (!s.value.metadata("names", &v) || strcmp(v.data, "{0: 'person', 1: 'bus'}") != 0) {
+        printf("FAIL: names\n");
+        return 1;
+    }
+    if (s.value.metadata("nope", &v) || v.len != 0) {
+        printf("FAIL: missing key\n");
+        return 1;
+    }
+    printf("ok\n");
+    return 0;
+}

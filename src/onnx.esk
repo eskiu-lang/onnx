@@ -53,6 +53,13 @@ const int ONNX_COREML = 2;
 const int ONNX_CUDA = 3;
 const int ONNX_DIRECTML = 4;
 const int ONNX_WEBGPU = 5;
+// Android NNAPI (GPU, NPU or DSP); OnnxOptions.nnapi_flags takes ONNX_NNAPI_* bits.
+const int ONNX_NNAPI = 6;
+
+const uint32 ONNX_NNAPI_FP16 = 1;
+const uint32 ONNX_NNAPI_NCHW = 2;
+const uint32 ONNX_NNAPI_CPU_DISABLED = 4;
+const uint32 ONNX_NNAPI_CPU_ONLY = 8;
 
 // Graph optimization levels for OnnxOptions.optimization.
 const int ONNX_OPT_DEFAULT = 0;
@@ -70,6 +77,7 @@ struct OnnxOptions {
     int device;
     bool fallback;
     string coreml_units;
+    uint32 nnapi_flags;
     // ONNX Runtime session configuration entries, "key=value" pairs separated by
     // commas (AddSessionConfigEntry), e.g. "mlas.disable_kleidiai=1". The
     // environment variable ONNX_CONFIG adds entries to every session.
@@ -278,6 +286,7 @@ bool onnx_has_provider(int provider) {
     if (provider == ONNX_CUDA) return _onnx_has("CUDAExecutionProvider");
     if (provider == ONNX_DIRECTML) return _onnx_has("DmlExecutionProvider");
     if (provider == ONNX_WEBGPU) return _onnx_has("WebGpuExecutionProvider");
+    if (provider == ONNX_NNAPI) return _onnx_has("NnapiExecutionProvider");
     return false;
 }
 
@@ -289,8 +298,17 @@ string onnx_provider_name(int provider) {
     if (provider == ONNX_CUDA) return "CUDA";
     if (provider == ONNX_DIRECTML) return "DirectML";
     if (provider == ONNX_WEBGPU) return "WebGPU";
+    if (provider == ONNX_NNAPI) return "NNAPI";
     return "unknown";
 }
+
+#ifdef __ANDROID__
+extern *void dlsym(*void handle, string name);
+
+struct _OnnxNnapiAppend {
+    fn(uint32)->*OrtStatus f;
+}
+#endif
 
 struct _OnnxDmlAppend {
     fn(int)->*OrtStatus f;
@@ -319,6 +337,16 @@ string _onnx_append_provider(*OrtSessionOptions so, *OnnxOptions o, int provider
         return _onnx_status(ort_SessionOptionsAppendExecutionProvider_CUDA_V2(so, cuda), "onnx: CUDA");
     }
     if (provider == ONNX_WEBGPU) return _onnx_status(ort_SessionOptionsAppendExecutionProvider(so, "WebGPU", null, null, 0), "onnx: WebGPU");
+#ifdef __ANDROID__
+    if (provider == ONNX_NNAPI) {
+        // Not in the OrtApi table: Android builds export it as a C function.
+        *void sym = dlsym(null, "OrtSessionOptionsAppendExecutionProvider_Nnapi");
+        if (sym == null) return _onnx_fail("onnx: NNAPI", "OrtSessionOptionsAppendExecutionProvider_Nnapi not found");
+        _OrtRaw r = _OrtRaw{sym, (*void)so};
+        fn(uint32)->*OrtStatus append = ((*_OnnxNnapiAppend)&r).f;
+        return _onnx_status(append(o.nnapi_flags), "onnx: NNAPI");
+    }
+#endif
     if (provider == ONNX_DIRECTML) {
         // The DirectML provider wants sequential execution and no memory patterns.
         string e = _onnx_status(ort_SetSessionExecutionMode(so, ORT_SEQUENTIAL), "onnx: DirectML");
@@ -343,6 +371,9 @@ int _onnx_auto_provider() {
 #endif
 #ifdef _WIN32
     if (onnx_has_provider(ONNX_DIRECTML)) return ONNX_DIRECTML;
+#endif
+#ifdef __ANDROID__
+    if (onnx_has_provider(ONNX_NNAPI)) return ONNX_NNAPI;
 #endif
     if (onnx_has_provider(ONNX_CUDA)) return ONNX_CUDA;
     return ONNX_CPU;
@@ -405,7 +436,7 @@ string _onnx_set_options(*OrtSessionOptions so, *OnnxOptions o, *int used) {
     int p = o.provider;
     if (p == ONNX_AUTO) p = _onnx_auto_provider();
     if (p == ONNX_CPU) return null;
-    if (p != ONNX_COREML && p != ONNX_CUDA && p != ONNX_DIRECTML && p != ONNX_WEBGPU) return _onnx_fail("onnx: unknown provider", null);
+    if (p != ONNX_COREML && p != ONNX_CUDA && p != ONNX_DIRECTML && p != ONNX_WEBGPU && p != ONNX_NNAPI) return _onnx_fail("onnx: unknown provider", null);
     if (!onnx_has_provider(p)) {
         if (o.fallback) return null;
         String have;
@@ -541,6 +572,24 @@ void OnnxSession_release(*OnnxSession self) {
     _onnx_info_free(&self.inputs);
     _onnx_info_free(&self.outputs);
     *self = OnnxSession{};
+}
+
+// The model's custom metadata entry `key` (e.g. "names" in an Ultralytics export)
+// into out. False when the model has no such entry or ORT fails to read it.
+bool OnnxSession_metadata(*OnnxSession self, string key, String* out) {
+    String_clear(out);
+    if (self.handle == null) return false;
+    *OrtModelMetadata meta = null;
+    if (_onnx_status(ort_SessionGetModelMetadata(self.handle, &meta), "onnx: SessionGetModelMetadata") != null) return false;
+    defer ort_ReleaseModelMetadata(meta);
+    *OrtAllocator a = null;
+    if (_onnx_status(ort_GetAllocatorWithDefaultOptions(&a), "onnx: GetAllocatorWithDefaultOptions") != null) return false;
+    string value = null;
+    if (_onnx_status(ort_ModelMetadataLookupCustomMetadataMap(meta, a, key, &value), "onnx: LookupCustomMetadataMap") != null) return false;
+    if (value == null) return false;
+    String_append(out, value);
+    ort_AllocatorFree(a, (*void)value);
+    return true;
 }
 
 int OnnxSession_input_count(*OnnxSession self) {

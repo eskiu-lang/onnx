@@ -100,6 +100,8 @@ for (i in 0..s.input_count()) {
 ```
 
 `s.input_index("x")` and `s.output_index("y")` find an input or output by name.
+`s.metadata("names", &out)` reads a custom metadata entry of the model into a `String`
+(false when the model has none by that name).
 
 ### Tensors
 
@@ -124,16 +126,18 @@ printf("running on %s\n", onnx_provider_name(s.provider));
 | `provider` | |
 |---|---|
 | `ONNX_CPU` | the default |
-| `ONNX_AUTO` | CoreML on Apple, DirectML on Windows, else CUDA, else the CPU |
+| `ONNX_AUTO` | CoreML on Apple, DirectML on Windows, NNAPI on Android, else CUDA, else the CPU |
 | `ONNX_COREML` | Apple's Core ML; `coreml_units` picks `"ALL"` (default), `"CPUAndGPU"`, `"CPUAndNeuralEngine"` or `"CPUOnly"` |
 | `ONNX_CUDA` | NVIDIA GPUs, with `device` as the GPU index |
 | `ONNX_DIRECTML` | DirectX 12 GPUs on Windows, with `device` as the adapter index |
 | `ONNX_WEBGPU` | WebGPU, in builds that include it |
+| `ONNX_NNAPI` | Android's NNAPI (GPU, NPU or DSP); `nnapi_flags` takes `ONNX_NNAPI_FP16`, `ONNX_NNAPI_NCHW`, `ONNX_NNAPI_CPU_DISABLED`, `ONNX_NNAPI_CPU_ONLY` |
 
 A provider the ONNX Runtime build lacks is an error that lists what it has, unless
 `fallback` is set, in which case the session runs on the CPU (and `s.provider` says so).
 `onnx_has_provider(ONNX_CUDA)` asks first. Which providers a build has depends on how it was
-built: the Homebrew and macOS release builds have CoreML (the release also WebGPU), the
+built: the Homebrew and macOS release builds have CoreML (the release also WebGPU), the Android AAR
+has NNAPI, the
 Linux and Windows release archives only the CPU. CUDA needs the `onnxruntime-gpu` archives,
 and DirectML the `Microsoft.ML.OnnxRuntime.DirectML` package.
 

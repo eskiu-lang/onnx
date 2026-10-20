@@ -63,8 +63,8 @@ int main() {
         printf("WebGPU ran\n");
     }
 
-    int[4] wanted = {ONNX_COREML, ONNX_CUDA, ONNX_DIRECTML, ONNX_WEBGPU};
-    for (i in 0..4) {
+    int[5] wanted = {ONNX_COREML, ONNX_CUDA, ONNX_DIRECTML, ONNX_WEBGPU, ONNX_NNAPI};
+    for (i in 0..5) {
         int p = wanted[i];
         if (onnx_has_provider(p)) continue;
         OnnxOptions strict = OnnxOptions{provider: p};

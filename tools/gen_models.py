@@ -121,6 +121,7 @@ def multi():
         [helper.make_tensor_value_info("sum", TensorProto.FLOAT, [2, 2]),
          helper.make_tensor_value_info("prod", TensorProto.FLOAT, [2, 2]),
          helper.make_tensor_value_info("neg", TensorProto.FLOAT, [2, 2])])
+    helper.set_model_props(m, {"names": "{0: 'person', 1: 'bus'}"})
     save(m, os.path.join(DATA, "multi.onnx"))
 
 
