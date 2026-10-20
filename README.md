@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-lang/onnx/actions/workflows/ci.yml"><img src="https://github.com/eskiu-lang/onnx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.1.0-6448d4" alt="Version 0.1.0">
+  <img src="https://img.shields.io/badge/version-0.1.1-6448d4" alt="Version 0.1.1">
   <img src="https://img.shields.io/badge/ONNX%20Runtime-1.31-orange" alt="ONNX Runtime 1.31">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
@@ -283,7 +283,7 @@ On Linux and Windows, ONNX Runtime comes from its
 Eskiu package (Eskiu 0.12 or newer):
 
 ```bash
-eskiuc add onnx --git https://github.com/eskiu-lang/onnx --rev v0.1.0
+eskiuc add onnx --git https://github.com/eskiu-lang/onnx --rev v0.1.1
 eskiuc build -L/opt/homebrew/lib       # the directory that holds libonnxruntime
 ```
 
