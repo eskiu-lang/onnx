@@ -21,11 +21,12 @@ jobs:
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $ORT/lib
       - name: Tests
-        run: eskiuc test -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib
+        # eskiuc downloads the ONNX Runtime archive the manifest names; ORT above is for the layout check.
+        run: eskiuc test
       - name: Examples
         run: |
           mkdir -p build
-          for f in examples/*.esk; do eskiuc -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib "$f" -o build/$(basename "$f" .esk); done
+          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
           build/classify | tee build/classify.txt
           grep -q "blue" build/classify.txt
 
@@ -41,11 +42,12 @@ jobs:
       - name: Layout check
         run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $ORT/lib
       - name: Tests
-        run: eskiuc test -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib
+        # eskiuc downloads the ONNX Runtime archive the manifest names; ORT above is for the layout check.
+        run: eskiuc test
       - name: Examples
         run: |
           mkdir -p build
-          for f in examples/*.esk; do eskiuc -L$ORT/lib --link-arg=-Wl,-rpath,$ORT/lib "$f" -o build/$(basename "$f" .esk); done
+          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
           build/classify --provider auto | tee build/classify.txt
           grep -q "blue" build/classify.txt
 
@@ -80,14 +82,12 @@ jobs:
       - name: Tests
         run: |
           export PATH="$HOME/eskiu/bin:$PATH"
-          # Windows loads the DLL beside the program first; System32 can hold an older onnxruntime.dll.
-          mkdir -p build/tests
-          cp $HOME/onnxruntime-win-x64-$ORT_VERSION/lib/*.dll build/tests/
-          CC=gcc eskiuc test -L$HOME/ort-link
+          # eskiuc downloads the manifest's ONNX Runtime and copies its DLLs next to each program,
+          # where Windows looks before System32 (which can hold an older onnxruntime.dll).
+          CC=gcc eskiuc test
       - name: Examples
         run: |
           export PATH="$HOME/eskiu/bin:$PATH"
-          cp $HOME/onnxruntime-win-x64-$ORT_VERSION/lib/*.dll build/
-          for f in examples/*.esk; do CC=gcc eskiuc -L$HOME/ort-link "$f" -o build/$(basename "$f" .esk).exe; done
+          for f in examples/*.esk; do CC=gcc eskiuc "$f" -o build/$(basename "$f" .esk).exe; done
           build/classify.exe | tee build/classify.txt
           grep -q "blue" build/classify.txt

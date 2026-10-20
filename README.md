@@ -200,7 +200,7 @@ with no arguments, it uses a tiny model in `examples/data` that names the main c
 image; with an ImageNet classifier from the ONNX model zoo it names objects:
 
 ```
-$ eskiuc build -L/opt/homebrew/lib
+$ eskiuc build
 $ build/onnx --model mobilenetv2-12.onnx --labels synset.txt messi5.jpg
 mobilenetv2-12.onnx on messi5.jpg (CPU), 224x224 input
  97.12%  n04254680 soccer ball
@@ -222,7 +222,7 @@ an image and the face's box from a face detector:
 
 ```
 $ curl -LO https://raw.githubusercontent.com/facenox/face-antispoof-onnx/main/models/best/98.20/best_model.onnx
-$ eskiuc -L/opt/homebrew/lib examples/minifasnet.esk -o build/minifasnet
+$ eskiuc examples/minifasnet.esk -o build/minifasnet
 $ build/minifasnet best_model.onnx face.jpg 212 197 346 387
 box 212 197 346 387, logits real 2.788116 spoof -2.788251
 real (live 99.62%, CPU)
@@ -237,9 +237,9 @@ part of this repository.
 
 | Platform | ONNX Runtime | Checked |
 |---|---|---|
-| macOS arm64 | Homebrew or the `osx-arm64` release archive | CI |
-| Linux x86-64 | the `linux-x64` release archive | CI |
-| Windows x86-64 (MinGW) | the `win-x64` release archive | CI |
+| macOS arm64 | the `osx-arm64` release archive, downloaded by `eskiuc build` | CI |
+| Linux x86-64 and arm64 | the `linux-x64` and `linux-aarch64` release archives, downloaded | CI (x86-64) |
+| Windows x86-64 (MinGW) | the `win-x64` release archive, downloaded | CI |
 | iOS (device and simulator) | the `onnxruntime-c` CocoaPods archive (1.30) | iOS simulator |
 | Android arm64 and x86_64 | the `onnxruntime-android` AAR | Android emulator (arm64) |
 
@@ -271,27 +271,24 @@ run it in the virtual machine; set `ONNX_CONFIG=mlas.disable_kleidiai=1` there.
 
 ## Install
 
-The package needs ONNX Runtime 1.16 or newer; the instructions below use 1.31:
-
-```bash
-brew install onnxruntime               # macOS
-```
-
-On Linux and Windows, ONNX Runtime comes from its
-[release archives](https://github.com/microsoft/onnxruntime/releases) (`onnxruntime-linux-x64-1.31.0.tgz`,
-`onnxruntime-linux-aarch64-1.31.0.tgz`, `onnxruntime-win-x64-1.31.0.zip`). Then, in an
-Eskiu package (Eskiu 0.12 or newer):
+In an Eskiu package (Eskiu 0.12 or newer):
 
 ```bash
 eskiuc add onnx --git https://github.com/eskiu-lang/onnx --rev v0.1.0
-eskiuc build -L/opt/homebrew/lib       # the directory that holds libonnxruntime
+eskiuc build
 ```
 
-With a release archive, pass its `lib` directory to `-L` and, on Linux and macOS, to the
-runtime loader too: `--link-arg=-Wl,-rpath,DIR`, or `LD_LIBRARY_PATH` on Linux. On Windows
-(MinGW), link against `onnxruntime.dll` itself (`-L` a directory that holds it) and put it
-next to the executable: Windows looks in `System32` before `PATH`, and `System32` may hold
-an older `onnxruntime.dll` that does not have API version 31.
+There is nothing else to install. The package's `eskiu.toml` names ONNX Runtime 1.31's own
+release archives for macOS arm64, Linux (x86-64 and arm64) and Windows (x86-64 and arm64):
+the first build that links it (`eskiuc build`, `run`, `test`) downloads the one for your
+machine, checks its SHA-256 and keeps it in `~/.eskiu/native`, and every build links
+against it, with no `-L`. On Windows the DLL is copied next to the program, ahead of an older
+`onnxruntime.dll` that `System32` may hold.
+
+The package works with ONNX Runtime 1.16 or newer. To use another build (Homebrew's, a GPU
+build, another platform), pass its library directory with `-L` and, on Linux and macOS,
+`--link-arg=-Wl,-rpath,DIR`; a platform the manifest does not list links against the
+system's library this way.
 
 ## Modules
 
@@ -327,7 +324,7 @@ Bug reports are welcome; please include the program, the `eskiuc --version` outp
 ONNX Runtime version. The tests and the layout check run with:
 
 ```bash
-eskiuc test -L/opt/homebrew/lib
+eskiuc test
 python3 tools/gen.py /opt/homebrew/opt/onnxruntime/include        # regenerates src/raw.esk
 python3 -I tools/gen_models.py                                    # regenerates the test models
 tools/layout_check.sh /opt/homebrew/opt/onnxruntime/include /opt/homebrew/lib
