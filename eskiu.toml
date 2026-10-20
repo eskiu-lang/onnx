@@ -1,0 +1,7 @@
+[package]
+name = "onnx"
+version = "0.1.0"
+main = "examples/classify.esk"
+
+[deps]
+gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "v0.1.0" }

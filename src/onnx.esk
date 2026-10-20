@@ -1,0 +1,861 @@
+// onnx.esk: ONNX model inference over ONNX Runtime (<onnx>).
+//
+// onnx_session() loads a model; OnnxSession_run() feeds it tensors by input name
+// and returns the outputs. Every fallible call returns a Result whose error is a
+// message from ONNX Runtime or from the checks here; the message lives in a buffer
+// that the next error reuses, so copy it to keep it. Sessions and tensors have a
+// release method, meant to be paired with defer:
+//
+//     OnnxSession s = onnx_session("model.onnx", null)?;
+//     defer s.release();
+//     int64[2] shape = {1, 4};
+//     OnnxTensor x = onnx_tensor_f32(&data[0], &shape[0], 2)?;
+//     defer x.release();
+//     OnnxTensor y = s.run1(&x)?;
+//     defer y.release();
+//     *float out = y.f32();
+//
+// The whole C API is in <onnx/raw> for anything this layer does not cover.
+
+import <io>;
+import <mem>;
+import <string>;
+import <list>;
+import <result>;
+import <onnx/raw>;
+
+#ifdef _WIN32
+extern int MultiByteToWideChar(uint32 code_page, uint32 flags, string s, int n, *uint16 out, int out_n);
+#endif
+
+// Element types, the values of ONNXTensorElementDataType.
+const int ONNX_UNDEFINED = 0;
+const int ONNX_FLOAT = 1;
+const int ONNX_UINT8 = 2;
+const int ONNX_INT8 = 3;
+const int ONNX_UINT16 = 4;
+const int ONNX_INT16 = 5;
+const int ONNX_INT32 = 6;
+const int ONNX_INT64 = 7;
+const int ONNX_STRING = 8;
+const int ONNX_BOOL = 9;
+const int ONNX_FLOAT16 = 10;
+const int ONNX_DOUBLE = 11;
+const int ONNX_UINT32 = 12;
+const int ONNX_UINT64 = 13;
+const int ONNX_BFLOAT16 = 16;
+
+// Execution providers for OnnxOptions.provider.
+const int ONNX_CPU = 0;
+const int ONNX_AUTO = 1;
+const int ONNX_COREML = 2;
+const int ONNX_CUDA = 3;
+const int ONNX_DIRECTML = 4;
+
+// Graph optimization levels for OnnxOptions.optimization.
+const int ONNX_OPT_DEFAULT = 0;
+const int ONNX_OPT_NONE = 1;
+const int ONNX_OPT_BASIC = 2;
+const int ONNX_OPT_EXTENDED = 3;
+const int ONNX_OPT_ALL = 4;
+
+// Session options. The zero value is the CPU provider with ONNX Runtime's defaults.
+struct OnnxOptions {
+    int threads;
+    int inter_threads;
+    int optimization;
+    int provider;
+    int device;
+    bool fallback;
+    string coreml_units;
+}
+
+// One model input or output: its name, element type and shape (-1 for a
+// dynamic dimension). type is ONNX_UNDEFINED for a value that is not a tensor.
+struct OnnxInfo {
+    String name;
+    int type;
+    List<int64> shape;
+}
+
+struct OnnxSession {
+    *OrtSession handle;
+    List<OnnxInfo> inputs;
+    List<OnnxInfo> outputs;
+    int provider;
+}
+
+// A tensor in CPU memory. The buffer belongs to the OrtValue and goes with release().
+struct OnnxTensor {
+    *OrtValue value;
+    int type;
+    List<int64> shape;
+    uint64 count;
+    *void data;
+}
+
+String _onnx_err;
+*OrtEnv _onnx_env_handle;
+int _onnx_log_level = 3;
+
+string _onnx_fail(string what, string detail) {
+    String_clear(&_onnx_err);
+    String_append(&_onnx_err, what);
+    if (detail != null) {
+        String_append(&_onnx_err, ": ");
+        String_append(&_onnx_err, detail);
+    }
+    return _onnx_err.data;
+}
+
+// null when the call succeeded; else the message, and the status is released.
+string _onnx_status(*OrtStatus st, string what) {
+    if (st == null) return null;
+    string msg = _onnx_fail(what, ort_GetErrorMessage(st));
+    ort_ReleaseStatus(st);
+    return msg;
+}
+
+// The ONNX Runtime version of the loaded library, such as "1.31.0".
+string onnx_version() {
+    return ort_version_string();
+}
+
+// Sets the logging level of the shared environment (0 verbose ... 4 fatal; the
+// default is 3, errors only). It takes effect if called before the first session.
+void onnx_set_log_level(int level) {
+    _onnx_log_level = level;
+}
+
+// The environment shared by every session, created on first use.
+Result<*OrtEnv, string> onnx_env() {
+    if (_onnx_env_handle != null) return Ok<*OrtEnv, string>(_onnx_env_handle);
+    if (ort_api() == null) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: ONNX Runtime %s does not provide API version %d (1.%d or newer is needed)",
+            ort_version_string(), (int)ORT_API_VERSION, (int)ORT_API_VERSION);
+        return Err<*OrtEnv, string>(_onnx_err.data);
+    }
+    *OrtEnv env = null;
+    string e = _onnx_status(ort_CreateEnv((OrtLoggingLevel)_onnx_log_level, "eskiu", &env), "onnx: CreateEnv");
+    if (e != null) return Err<*OrtEnv, string>(e);
+    _onnx_env_handle = env;
+    return Ok<*OrtEnv, string>(env);
+}
+
+// The bytes of one element of the given type; 0 for strings and unknown types.
+int onnx_type_size(int type) {
+    if (type == ONNX_UINT8 || type == ONNX_INT8 || type == ONNX_BOOL) return 1;
+    if (type == ONNX_UINT16 || type == ONNX_INT16 || type == ONNX_FLOAT16 || type == ONNX_BFLOAT16) return 2;
+    if (type == ONNX_FLOAT || type == ONNX_INT32 || type == ONNX_UINT32) return 4;
+    if (type == ONNX_INT64 || type == ONNX_UINT64 || type == ONNX_DOUBLE) return 8;
+    return 0;
+}
+
+// The ONNX name of an element type ("float", "int64", ...).
+string onnx_type_name(int type) {
+    if (type == ONNX_FLOAT) return "float";
+    if (type == ONNX_UINT8) return "uint8";
+    if (type == ONNX_INT8) return "int8";
+    if (type == ONNX_UINT16) return "uint16";
+    if (type == ONNX_INT16) return "int16";
+    if (type == ONNX_INT32) return "int32";
+    if (type == ONNX_INT64) return "int64";
+    if (type == ONNX_STRING) return "string";
+    if (type == ONNX_BOOL) return "bool";
+    if (type == ONNX_FLOAT16) return "float16";
+    if (type == ONNX_DOUBLE) return "double";
+    if (type == ONNX_UINT32) return "uint32";
+    if (type == ONNX_UINT64) return "uint64";
+    if (type == ONNX_BFLOAT16) return "bfloat16";
+    if (type == ONNX_UNDEFINED) return "not a tensor";
+    return "other";
+}
+
+// Appends a shape as [1, 3, -1] to out.
+void onnx_shape_text(*int64 shape, int rank, String* out) {
+    String_append(out, "[");
+    for (i in 0..rank) {
+        if (i > 0) String_append(out, ", ");
+        String_appendf(out, "%lld", shape[i]);
+    }
+    String_append(out, "]");
+}
+
+// --- float16 ---
+
+// The IEEE half-precision bits of f, rounded to nearest even.
+uint16 onnx_f32_to_f16(float f) {
+    float v = f;
+    uint32 x = *(*uint32)&v;
+    uint32 sign = (x >> 16) & 0x8000;
+    uint32 e = (x >> 23) & 0xff;
+    uint32 m = x & 0x7fffff;
+    if (e == 255) {
+        if (m != 0) return (uint16)(sign | 0x7e00);
+        return (uint16)(sign | 0x7c00);
+    }
+    int ex = (int)e - 112;
+    if (ex >= 31) return (uint16)(sign | 0x7c00);
+    if (ex <= 0) {
+        if (ex < -10) return (uint16)sign;
+        m = m | 0x800000;
+        uint32 shift = (uint32)(14 - ex);
+        uint32 h = m >> shift;
+        uint32 rem = m & (((uint32)1 << shift) - 1);
+        uint32 mid = (uint32)1 << (shift - 1);
+        if (rem > mid || (rem == mid && (h & 1) != 0)) h++;
+        return (uint16)(sign | h);
+    }
+    uint32 h = sign | ((uint32)ex << 10) | (m >> 13);
+    uint32 rem = m & 0x1fff;
+    if (rem > 0x1000 || (rem == 0x1000 && (h & 1) != 0)) h++;
+    return (uint16)h;
+}
+
+// The float value of IEEE half-precision bits.
+float onnx_f16_to_f32(uint16 bits) {
+    uint32 hb = (uint32)bits;
+    uint32 s = (hb & 0x8000) << 16;
+    uint32 e = (hb >> 10) & 0x1f;
+    uint32 m = hb & 0x3ff;
+    uint32 x = s;
+    if (e == 31) {
+        x = s | 0x7f800000 | (m << 13);
+    } else if (e != 0) {
+        x = s | ((e + 112) << 23) | (m << 13);
+    } else if (m != 0) {
+        uint32 ee = 113;
+        while ((m & 0x400) == 0) {
+            m = m << 1;
+            ee--;
+        }
+        x = s | (ee << 23) | ((m & 0x3ff) << 13);
+    }
+    float f = *(*float)&x;
+    return f;
+}
+
+// --- providers ---
+
+bool _onnx_has(string name) {
+    *string names = null;
+    int n = 0;
+    if (_onnx_status(ort_GetAvailableProviders(&names, &n), "onnx: GetAvailableProviders") != null) return false;
+    bool found = false;
+    for (i in 0..n) {
+        if (strcmp(names[i], name) == 0) found = true;
+    }
+    _onnx_status(ort_ReleaseAvailableProviders(names, n), "onnx: ReleaseAvailableProviders");
+    return found;
+}
+
+// The execution providers this ONNX Runtime build has, comma-separated, appended
+// to out (such as "CoreMLExecutionProvider, CPUExecutionProvider").
+void onnx_providers(String* out) {
+    *string names = null;
+    int n = 0;
+    if (ort_api() == null) return;
+    if (_onnx_status(ort_GetAvailableProviders(&names, &n), "onnx: GetAvailableProviders") != null) return;
+    for (i in 0..n) {
+        if (i > 0) String_append(out, ", ");
+        String_append(out, names[i]);
+    }
+    _onnx_status(ort_ReleaseAvailableProviders(names, n), "onnx: ReleaseAvailableProviders");
+}
+
+// True when this ONNX Runtime build has the provider (ONNX_COREML, ONNX_CUDA, ...).
+bool onnx_has_provider(int provider) {
+    if (ort_api() == null) return false;
+    if (provider == ONNX_CPU || provider == ONNX_AUTO) return true;
+    if (provider == ONNX_COREML) return _onnx_has("CoreMLExecutionProvider");
+    if (provider == ONNX_CUDA) return _onnx_has("CUDAExecutionProvider");
+    if (provider == ONNX_DIRECTML) return _onnx_has("DmlExecutionProvider");
+    return false;
+}
+
+// The name of a provider constant ("CPU", "CoreML", "CUDA", "DirectML").
+string onnx_provider_name(int provider) {
+    if (provider == ONNX_CPU) return "CPU";
+    if (provider == ONNX_AUTO) return "auto";
+    if (provider == ONNX_COREML) return "CoreML";
+    if (provider == ONNX_CUDA) return "CUDA";
+    if (provider == ONNX_DIRECTML) return "DirectML";
+    return "unknown";
+}
+
+struct _OnnxDmlAppend {
+    fn(int)->*OrtStatus f;
+}
+
+string _onnx_append_provider(*OrtSessionOptions so, *OnnxOptions o, int provider) {
+    if (provider == ONNX_COREML) {
+        string[1] keys = {"MLComputeUnits"};
+        string[1] values = {"ALL"};
+        if (o.coreml_units != null) values[0] = o.coreml_units;
+        return _onnx_status(ort_SessionOptionsAppendExecutionProvider(so, "CoreML", &keys[0], &values[0], 1),
+            "onnx: CoreML");
+    }
+    if (provider == ONNX_CUDA) {
+        *OrtCUDAProviderOptionsV2 cuda = null;
+        string e = _onnx_status(ort_CreateCUDAProviderOptions(&cuda), "onnx: CUDA");
+        if (e != null) return e;
+        defer ort_ReleaseCUDAProviderOptions(cuda);
+        String dev;
+        defer String_free(&dev);
+        String_appendf(&dev, "%d", o.device);
+        string[1] keys = {"device_id"};
+        string[1] values = {(string)dev.data};
+        e = _onnx_status(ort_UpdateCUDAProviderOptions(cuda, &keys[0], &values[0], 1), "onnx: CUDA");
+        if (e != null) return e;
+        return _onnx_status(ort_SessionOptionsAppendExecutionProvider_CUDA_V2(so, cuda), "onnx: CUDA");
+    }
+    if (provider == ONNX_DIRECTML) {
+        // The DirectML provider wants sequential execution and no memory patterns.
+        string e = _onnx_status(ort_SetSessionExecutionMode(so, ORT_SEQUENTIAL), "onnx: DirectML");
+        if (e != null) return e;
+        e = _onnx_status(ort_DisableMemPattern(so), "onnx: DirectML");
+        if (e != null) return e;
+        **void dml = null;
+        e = _onnx_status(ort_GetExecutionProviderApi("DML", ORT_API_VERSION, (**void)&dml), "onnx: DirectML");
+        if (e != null) return e;
+        // OrtDmlApi's first entry is SessionOptionsAppendExecutionProvider_DML(options, device_id).
+        _OrtRaw r = _OrtRaw{dml[0], (*void)so};
+        fn(int)->*OrtStatus append = ((*_OnnxDmlAppend)&r).f;
+        return _onnx_status(append(o.device), "onnx: DirectML");
+    }
+    return null;
+}
+
+// The first provider of the platform's preferred ones that this build has.
+int _onnx_auto_provider() {
+#ifdef __APPLE__
+    if (onnx_has_provider(ONNX_COREML)) return ONNX_COREML;
+#endif
+#ifdef _WIN32
+    if (onnx_has_provider(ONNX_DIRECTML)) return ONNX_DIRECTML;
+#endif
+    if (onnx_has_provider(ONNX_CUDA)) return ONNX_CUDA;
+    return ONNX_CPU;
+}
+
+string _onnx_set_options(*OrtSessionOptions so, *OnnxOptions o, *int used) {
+    *used = ONNX_CPU;
+    if (o == null) return null;
+    string e = null;
+    if (o.threads > 0) {
+        e = _onnx_status(ort_SetIntraOpNumThreads(so, o.threads), "onnx: SetIntraOpNumThreads");
+        if (e != null) return e;
+    }
+    if (o.inter_threads > 0) {
+        e = _onnx_status(ort_SetInterOpNumThreads(so, o.inter_threads), "onnx: SetInterOpNumThreads");
+        if (e != null) return e;
+    }
+    if (o.optimization != ONNX_OPT_DEFAULT) {
+        GraphOptimizationLevel level = ORT_ENABLE_ALL;
+        if (o.optimization == ONNX_OPT_NONE) level = ORT_DISABLE_ALL;
+        if (o.optimization == ONNX_OPT_BASIC) level = ORT_ENABLE_BASIC;
+        if (o.optimization == ONNX_OPT_EXTENDED) level = ORT_ENABLE_EXTENDED;
+        e = _onnx_status(ort_SetSessionGraphOptimizationLevel(so, level), "onnx: SetSessionGraphOptimizationLevel");
+        if (e != null) return e;
+    }
+    int p = o.provider;
+    if (p == ONNX_AUTO) p = _onnx_auto_provider();
+    if (p == ONNX_CPU) return null;
+    if (p != ONNX_COREML && p != ONNX_CUDA && p != ONNX_DIRECTML) return _onnx_fail("onnx: unknown provider", null);
+    if (!onnx_has_provider(p)) {
+        if (o.fallback) return null;
+        String have;
+        defer String_free(&have);
+        onnx_providers(&have);
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: this ONNX Runtime %s has no %s provider (it has: %s)",
+            ort_version_string(), onnx_provider_name(p), (string)have.data);
+        return _onnx_err.data;
+    }
+    e = _onnx_append_provider(so, o, p);
+    if (e != null) {
+        if (o.fallback) return null;
+        return e;
+    }
+    *used = p;
+    return null;
+}
+
+// --- sessions ---
+
+void _onnx_info_free(List<OnnxInfo>* l) {
+    for (i in 0..l.size) {
+        String_free(&l.data[i].name);
+        List_free(&l.data[i].shape);
+    }
+    List_free(l);
+}
+
+string _onnx_type_info(*OrtTypeInfo ti, *OnnxInfo info) {
+    *OrtTensorTypeAndShapeInfo t = null;
+    string e = _onnx_status(ort_CastTypeInfoToTensorInfo(ti, &t), "onnx: CastTypeInfoToTensorInfo");
+    if (e != null || t == null) return e;
+    ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    e = _onnx_status(ort_GetTensorElementType(t, &et), "onnx: GetTensorElementType");
+    if (e != null) return e;
+    info.type = (int)et;
+    uint64 rank = 0;
+    e = _onnx_status(ort_GetDimensionsCount(t, &rank), "onnx: GetDimensionsCount");
+    if (e != null) return e;
+    *int64 dims = alloc<int64>((int)rank + 1);
+    defer free(dims);
+    e = _onnx_status(ort_GetDimensions(t, dims, rank), "onnx: GetDimensions");
+    if (e != null) return e;
+    for (i in 0..(int)rank) List_push(&info.shape, dims[i]);
+    return null;
+}
+
+string _onnx_read_infos(*OrtSession s, bool inputs, List<OnnxInfo>* out) {
+    *OrtAllocator a = null;
+    string e = _onnx_status(ort_GetAllocatorWithDefaultOptions(&a), "onnx: GetAllocatorWithDefaultOptions");
+    if (e != null) return e;
+    uint64 n = 0;
+    if (inputs) e = _onnx_status(ort_SessionGetInputCount(s, &n), "onnx: SessionGetInputCount");
+    else e = _onnx_status(ort_SessionGetOutputCount(s, &n), "onnx: SessionGetOutputCount");
+    if (e != null) return e;
+    for (i in 0..(int)n) {
+        OnnxInfo info;
+        List_push(out, info);
+        *OnnxInfo p = &out.data[out.size - 1];
+        string name = null;
+        if (inputs) e = _onnx_status(ort_SessionGetInputName(s, (uint64)i, a, &name), "onnx: SessionGetInputName");
+        else e = _onnx_status(ort_SessionGetOutputName(s, (uint64)i, a, &name), "onnx: SessionGetOutputName");
+        if (e != null) return e;
+        String_append(&p.name, name);
+        ort_AllocatorFree(a, (*void)name);
+        *OrtTypeInfo ti = null;
+        if (inputs) e = _onnx_status(ort_SessionGetInputTypeInfo(s, (uint64)i, &ti), "onnx: SessionGetInputTypeInfo");
+        else e = _onnx_status(ort_SessionGetOutputTypeInfo(s, (uint64)i, &ti), "onnx: SessionGetOutputTypeInfo");
+        if (e != null) return e;
+        e = _onnx_type_info(ti, p);
+        ort_ReleaseTypeInfo(ti);
+        if (e != null) return e;
+    }
+    return null;
+}
+
+Result<OnnxSession, string> _onnx_finish(*OrtSession handle, int provider) {
+    OnnxSession s;
+    s.handle = handle;
+    s.provider = provider;
+    string e = _onnx_read_infos(handle, true, &s.inputs);
+    if (e == null) e = _onnx_read_infos(handle, false, &s.outputs);
+    if (e != null) {
+        s.release();
+        return Err<OnnxSession, string>(e);
+    }
+    return Ok<OnnxSession, string>(s);
+}
+
+// Loads a model file. opts may be null for the defaults (CPU).
+Result<OnnxSession, string> onnx_session(string path, *OnnxOptions opts) {
+    *OrtEnv env = onnx_env()?;
+    *OrtSessionOptions so = null;
+    string e = _onnx_status(ort_CreateSessionOptions(&so), "onnx: CreateSessionOptions");
+    if (e != null) return Err<OnnxSession, string>(e);
+    defer ort_ReleaseSessionOptions(so);
+    int provider = ONNX_CPU;
+    e = _onnx_set_options(so, opts, &provider);
+    if (e != null) return Err<OnnxSession, string>(e);
+    *OrtSession handle = null;
+#ifdef _WIN32
+    int n = MultiByteToWideChar(65001, 0, path, -1, null, 0);
+    *uint16 wide = alloc<uint16>(n + 1);
+    MultiByteToWideChar(65001, 0, path, -1, wide, n);
+    e = _onnx_status(ort_CreateSession(env, wide, so, &handle), "onnx: cannot load model");
+    free(wide);
+#else
+    e = _onnx_status(ort_CreateSession(env, (*ORTCHAR_T)path, so, &handle), "onnx: cannot load model");
+#endif
+    if (e != null) return Err<OnnxSession, string>(e);
+    return _onnx_finish(handle, provider);
+}
+
+// Loads a model from bytes in memory (the contents of a .onnx file).
+Result<OnnxSession, string> onnx_session_bytes(*uint8 data, uint64 len, *OnnxOptions opts) {
+    *OrtEnv env = onnx_env()?;
+    *OrtSessionOptions so = null;
+    string e = _onnx_status(ort_CreateSessionOptions(&so), "onnx: CreateSessionOptions");
+    if (e != null) return Err<OnnxSession, string>(e);
+    defer ort_ReleaseSessionOptions(so);
+    int provider = ONNX_CPU;
+    e = _onnx_set_options(so, opts, &provider);
+    if (e != null) return Err<OnnxSession, string>(e);
+    *OrtSession handle = null;
+    e = _onnx_status(ort_CreateSessionFromArray(env, (*void)data, len, so, &handle), "onnx: cannot load model");
+    if (e != null) return Err<OnnxSession, string>(e);
+    return _onnx_finish(handle, provider);
+}
+
+void OnnxSession_release(*OnnxSession self) {
+    if (self.handle != null) ort_ReleaseSession(self.handle);
+    _onnx_info_free(&self.inputs);
+    _onnx_info_free(&self.outputs);
+    *self = OnnxSession{};
+}
+
+int OnnxSession_input_count(*OnnxSession self) {
+    return self.inputs.size;
+}
+
+int OnnxSession_output_count(*OnnxSession self) {
+    return self.outputs.size;
+}
+
+// The i-th input's name, type and shape; null when i is out of range.
+*OnnxInfo OnnxSession_input(*OnnxSession self, int i) {
+    if (i < 0 || i >= self.inputs.size) return null;
+    return &self.inputs.data[i];
+}
+
+*OnnxInfo OnnxSession_output(*OnnxSession self, int i) {
+    if (i < 0 || i >= self.outputs.size) return null;
+    return &self.outputs.data[i];
+}
+
+int _onnx_find(List<OnnxInfo>* l, string name) {
+    if (name == null) return -1;
+    for (i in 0..l.size) {
+        if (strcmp(l.data[i].name.data, name) == 0) return i;
+    }
+    return -1;
+}
+
+// The index of the input with this name, or -1.
+int OnnxSession_input_index(*OnnxSession self, string name) {
+    return _onnx_find(&self.inputs, name);
+}
+
+int OnnxSession_output_index(*OnnxSession self, string name) {
+    return _onnx_find(&self.outputs, name);
+}
+
+string _onnx_no_such(string kind, string name, List<OnnxInfo>* l) {
+    String_clear(&_onnx_err);
+    String_appendf(&_onnx_err, "onnx: the model has no %s named '%s' (%ss: ", kind, name == null ? "(null)" : name, kind);
+    for (i in 0..l.size) {
+        if (i > 0) String_append(&_onnx_err, ", ");
+        String_append(&_onnx_err, l.data[i].name.data);
+    }
+    String_append(&_onnx_err, ")");
+    return _onnx_err.data;
+}
+
+string _onnx_check_input(*OnnxInfo info, *OnnxTensor t) {
+    if (t == null || t.value == null) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: input '%s' is an empty tensor", (string)info.name.data);
+        return _onnx_err.data;
+    }
+    if (info.type != ONNX_UNDEFINED && t.type != info.type) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: input '%s' is %s, the model wants %s", (string)info.name.data,
+            onnx_type_name(t.type), onnx_type_name(info.type));
+        return _onnx_err.data;
+    }
+    bool ok = info.shape.size == t.shape.size;
+    if (ok) {
+        for (i in 0..info.shape.size) {
+            if (info.shape.data[i] >= 0 && info.shape.data[i] != t.shape.data[i]) ok = false;
+        }
+    }
+    if (!ok && info.type != ONNX_UNDEFINED) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: input '%s' has shape ", (string)info.name.data);
+        onnx_shape_text(t.shape.data, t.shape.size, &_onnx_err);
+        String_append(&_onnx_err, ", the model wants ");
+        onnx_shape_text(info.shape.data, info.shape.size, &_onnx_err);
+        return _onnx_err.data;
+    }
+    return null;
+}
+
+// Runs the model. names[i] is the input that inputs[i] feeds, for n inputs; every
+// model input must be given. outputs names the n_out outputs to compute, in the
+// order wanted; null (with n_out 0) computes them all, in model order. The result
+// holds one tensor per output, to free with onnx_tensors_free.
+Result<List<OnnxTensor>, string> OnnxSession_run(*OnnxSession self, *string names, *OnnxTensor inputs, int n, *string outputs, int n_out) {
+    if (self.handle == null) return Err<List<OnnxTensor>, string>(_onnx_fail("onnx: the session is released", null));
+    if (n < 0 || n_out < 0) return Err<List<OnnxTensor>, string>(_onnx_fail("onnx: negative count", null));
+    for (i in 0..n) {
+        int k = _onnx_find(&self.inputs, names[i]);
+        if (k < 0) return Err<List<OnnxTensor>, string>(_onnx_no_such("input", names[i], &self.inputs));
+        for (j in 0..i) {
+            if (strcmp(names[j], names[i]) == 0) {
+                String_clear(&_onnx_err);
+                String_appendf(&_onnx_err, "onnx: input '%s' is given twice", names[i]);
+                return Err<List<OnnxTensor>, string>(_onnx_err.data);
+            }
+        }
+        string e = _onnx_check_input(&self.inputs.data[k], &inputs[i]);
+        if (e != null) return Err<List<OnnxTensor>, string>(e);
+    }
+    for (k in 0..self.inputs.size) {
+        bool given = false;
+        for (i in 0..n) {
+            if (strcmp(names[i], self.inputs.data[k].name.data) == 0) given = true;
+        }
+        if (!given) {
+            String_clear(&_onnx_err);
+            String_appendf(&_onnx_err, "onnx: input '%s' is missing", (string)self.inputs.data[k].name.data);
+            return Err<List<OnnxTensor>, string>(_onnx_err.data);
+        }
+    }
+    int m = n_out;
+    if (outputs == null) m = self.outputs.size;
+    *string out_names = alloc<string>(m + 1);
+    defer free(out_names);
+    for (i in 0..m) {
+        if (outputs == null) {
+            out_names[i] = self.outputs.data[i].name.data;
+        } else {
+            if (_onnx_find(&self.outputs, outputs[i]) < 0) return Err<List<OnnxTensor>, string>(_onnx_no_such("output", outputs[i], &self.outputs));
+            out_names[i] = outputs[i];
+        }
+    }
+    **OrtValue in_values = alloc<*OrtValue>(n + 1);
+    defer free(in_values);
+    for (i in 0..n) in_values[i] = inputs[i].value;
+    **OrtValue out_values = alloc<*OrtValue>(m + 1);
+    defer free(out_values);
+    string e = _onnx_status(ort_Run(self.handle, null, names, in_values, (uint64)n, out_names, (uint64)m, out_values), "onnx: Run");
+    if (e != null) {
+        for (i in 0..m) {
+            if (out_values[i] != null) ort_ReleaseValue(out_values[i]);
+        }
+        return Err<List<OnnxTensor>, string>(e);
+    }
+    List<OnnxTensor> result;
+    for (i in 0..m) {
+        OnnxTensor t;
+        if (e == null) {
+            e = _onnx_wrap(out_values[i], &t);
+            if (e != null) {
+                String msg;
+                String_append(&msg, e);
+                String_clear(&_onnx_err);
+                String_appendf(&_onnx_err, "onnx: output '%s': %s", out_names[i], (string)msg.data);
+                String_free(&msg);
+                e = _onnx_err.data;
+            }
+        }
+        if (e == null) List_push(&result, t);
+        else if (out_values[i] != null) ort_ReleaseValue(out_values[i]);
+    }
+    if (e != null) {
+        onnx_tensors_free(&result);
+        return Err<List<OnnxTensor>, string>(e);
+    }
+    return Ok<List<OnnxTensor>, string>(result);
+}
+
+// Runs a model with one input and returns its first output.
+Result<OnnxTensor, string> OnnxSession_run1(*OnnxSession self, *OnnxTensor input) {
+    if (self.inputs.size != 1) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: run1 needs a model with one input; this one has %d", self.inputs.size);
+        return Err<OnnxTensor, string>(_onnx_err.data);
+    }
+    if (self.outputs.size < 1) return Err<OnnxTensor, string>(_onnx_fail("onnx: the model has no outputs", null));
+    string[1] names = {self.inputs.data[0].name.data};
+    string[1] outs = {self.outputs.data[0].name.data};
+    List<OnnxTensor> r = self.run(&names[0], input, 1, &outs[0], 1)?;
+    OnnxTensor t = r.data[0];
+    List_free(&r);
+    return Ok<OnnxTensor, string>(t);
+}
+
+// --- tensors ---
+
+// Fills t from an OrtValue, which t then owns.
+string _onnx_wrap(*OrtValue v, *OnnxTensor t) {
+    *t = OnnxTensor{};
+    if (v == null) return "no value";
+    int is_tensor = 0;
+    string e = _onnx_status(ort_IsTensor(v, &is_tensor), "IsTensor");
+    if (e != null) return e;
+    if (is_tensor == 0) return "not a tensor";
+    *OrtTensorTypeAndShapeInfo info = null;
+    e = _onnx_status(ort_GetTensorTypeAndShape(v, &info), "GetTensorTypeAndShape");
+    if (e != null) return e;
+    defer ort_ReleaseTensorTypeAndShapeInfo(info);
+    ONNXTensorElementDataType et = ONNX_TENSOR_ELEMENT_DATA_TYPE_UNDEFINED;
+    e = _onnx_status(ort_GetTensorElementType(info, &et), "GetTensorElementType");
+    if (e != null) return e;
+    uint64 rank = 0;
+    e = _onnx_status(ort_GetDimensionsCount(info, &rank), "GetDimensionsCount");
+    if (e != null) return e;
+    *int64 dims = alloc<int64>((int)rank + 1);
+    defer free(dims);
+    e = _onnx_status(ort_GetDimensions(info, dims, rank), "GetDimensions");
+    if (e != null) return e;
+    uint64 count = 0;
+    e = _onnx_status(ort_GetTensorShapeElementCount(info, &count), "GetTensorShapeElementCount");
+    if (e != null) return e;
+    *void data = null;
+    if ((int)et != ONNX_STRING) {
+        e = _onnx_status(ort_GetTensorMutableData(v, &data), "GetTensorMutableData");
+        if (e != null) return e;
+    }
+    t.value = v;
+    t.type = (int)et;
+    t.count = count;
+    t.data = data;
+    for (i in 0..(int)rank) List_push(&t.shape, dims[i]);
+    return null;
+}
+
+// A new tensor of the given element type and shape, with its elements copied from
+// data, or zero when data is null. shape has rank dimensions, none negative.
+Result<OnnxTensor, string> onnx_tensor(int type, *void data, *int64 shape, int rank) {
+    onnx_env()?;
+    int size = onnx_type_size(type);
+    if (size == 0) {
+        String_clear(&_onnx_err);
+        String_appendf(&_onnx_err, "onnx: cannot make a tensor of %s", onnx_type_name(type));
+        return Err<OnnxTensor, string>(_onnx_err.data);
+    }
+    if (rank < 0 || (rank > 0 && shape == null)) return Err<OnnxTensor, string>(_onnx_fail("onnx: bad shape", null));
+    uint64 count = 1;
+    for (i in 0..rank) {
+        if (shape[i] < 0) {
+            String_clear(&_onnx_err);
+            String_append(&_onnx_err, "onnx: a tensor shape cannot have a negative dimension: ");
+            onnx_shape_text(shape, rank, &_onnx_err);
+            return Err<OnnxTensor, string>(_onnx_err.data);
+        }
+        count = count * (uint64)shape[i];
+    }
+    *OrtAllocator a = null;
+    string e = _onnx_status(ort_GetAllocatorWithDefaultOptions(&a), "onnx: GetAllocatorWithDefaultOptions");
+    if (e != null) return Err<OnnxTensor, string>(e);
+    int64 one = 0;
+    *int64 dims = shape;
+    if (dims == null) dims = &one;
+    *OrtValue v = null;
+    e = _onnx_status(ort_CreateTensorAsOrtValue(a, dims, (uint64)rank, (ONNXTensorElementDataType)type, &v), "onnx: CreateTensorAsOrtValue");
+    if (e != null) return Err<OnnxTensor, string>(e);
+    OnnxTensor t;
+    e = _onnx_wrap(v, &t);
+    if (e != null) {
+        ort_ReleaseValue(v);
+        return Err<OnnxTensor, string>(_onnx_fail("onnx: tensor", e));
+    }
+    if (t.data != null && t.count > 0) {
+        int64 bytes = (int64)t.count * (int64)size;
+        if (data != null) memcpy(t.data, data, bytes);
+        else memset(t.data, 0, bytes);
+    }
+    return Ok<OnnxTensor, string>(t);
+}
+
+Result<OnnxTensor, string> onnx_tensor_f32(*float data, *int64 shape, int rank) {
+    return onnx_tensor(ONNX_FLOAT, (*void)data, shape, rank);
+}
+
+Result<OnnxTensor, string> onnx_tensor_f16(*uint16 data, *int64 shape, int rank) {
+    return onnx_tensor(ONNX_FLOAT16, (*void)data, shape, rank);
+}
+
+Result<OnnxTensor, string> onnx_tensor_i64(*int64 data, *int64 shape, int rank) {
+    return onnx_tensor(ONNX_INT64, (*void)data, shape, rank);
+}
+
+Result<OnnxTensor, string> onnx_tensor_i32(*int data, *int64 shape, int rank) {
+    return onnx_tensor(ONNX_INT32, (*void)data, shape, rank);
+}
+
+Result<OnnxTensor, string> onnx_tensor_u8(*uint8 data, *int64 shape, int rank) {
+    return onnx_tensor(ONNX_UINT8, (*void)data, shape, rank);
+}
+
+void OnnxTensor_release(*OnnxTensor self) {
+    if (self.value != null) ort_ReleaseValue(self.value);
+    List_free(&self.shape);
+    *self = OnnxTensor{};
+}
+
+// Releases every tensor of a run's result, then the list.
+void onnx_tensors_free(List<OnnxTensor>* l) {
+    for (i in 0..l.size) l.data[i].release();
+    List_free(l);
+}
+
+int OnnxTensor_rank(*OnnxTensor self) {
+    return self.shape.size;
+}
+
+// The i-th dimension, or 0 when i is out of range.
+int64 OnnxTensor_dim(*OnnxTensor self, int i) {
+    if (i < 0 || i >= self.shape.size) return 0;
+    return self.shape.data[i];
+}
+
+// The number of elements.
+uint64 OnnxTensor_len(*OnnxTensor self) {
+    return self.count;
+}
+
+// The elements as the given C type, or null when the tensor holds another type.
+*float OnnxTensor_f32(*OnnxTensor self) {
+    if (self.type != ONNX_FLOAT) return null;
+    return (*float)self.data;
+}
+
+*uint16 OnnxTensor_f16(*OnnxTensor self) {
+    if (self.type != ONNX_FLOAT16) return null;
+    return (*uint16)self.data;
+}
+
+*int64 OnnxTensor_i64(*OnnxTensor self) {
+    if (self.type != ONNX_INT64) return null;
+    return (*int64)self.data;
+}
+
+*int OnnxTensor_i32(*OnnxTensor self) {
+    if (self.type != ONNX_INT32) return null;
+    return (*int)self.data;
+}
+
+*uint8 OnnxTensor_u8(*OnnxTensor self) {
+    if (self.type != ONNX_UINT8) return null;
+    return (*uint8)self.data;
+}
+
+// Element i as a double, whatever the numeric type; 0 when i is out of range.
+double OnnxTensor_at(*OnnxTensor self, uint64 i) {
+    if (i >= self.count || self.data == null) return 0.0;
+    int t = self.type;
+    if (t == ONNX_FLOAT) return (double)((*float)self.data)[i];
+    if (t == ONNX_DOUBLE) return ((*double)self.data)[i];
+    if (t == ONNX_FLOAT16) return (double)onnx_f16_to_f32(((*uint16)self.data)[i]);
+    if (t == ONNX_BFLOAT16) {
+        uint32 x = (uint32)((*uint16)self.data)[i] << 16;
+        float f = *(*float)&x;
+        return (double)f;
+    }
+    if (t == ONNX_UINT8 || t == ONNX_BOOL) return (double)((*uint8)self.data)[i];
+    if (t == ONNX_INT8) return (double)((*int8)self.data)[i];
+    if (t == ONNX_UINT16) return (double)((*uint16)self.data)[i];
+    if (t == ONNX_INT16) return (double)((*int16)self.data)[i];
+    if (t == ONNX_INT32) return (double)((*int)self.data)[i];
+    if (t == ONNX_UINT32) return (double)((*uint32)self.data)[i];
+    if (t == ONNX_INT64) return (double)((*int64)self.data)[i];
+    if (t == ONNX_UINT64) return (double)((*uint64)self.data)[i];
+    return 0.0;
+}
+
+// The index of the largest element (of a float or any numeric tensor).
+uint64 OnnxTensor_argmax(*OnnxTensor self) {
+    uint64 best = 0;
+    for (i in 1..self.count) {
+        if (self.at(i) > self.at(best)) best = i;
+    }
+    return best;
+}
