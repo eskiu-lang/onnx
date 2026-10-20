@@ -1,0 +1,28 @@
+import <io>;
+import <mem>;
+import <onnx>;
+
+// Session configuration entries: valid ones are accepted, a malformed list is an error,
+// and ort_api_version() reports the OrtApi version in use.
+
+int main() {
+    OnnxOptions ok = OnnxOptions{config: "session.intra_op.allow_spinning=0,mlas.disable_kleidiai=1"};
+    Result<OnnxSession, string> s = onnx_session("tests/data/mlp.onnx", &ok);
+    if (!s.ok) {
+        printf("FAIL: %s\n", s.error);
+        return 1;
+    }
+    s.value.release();
+    OnnxOptions bad = OnnxOptions{config: "no-value"};
+    Result<OnnxSession, string> b = onnx_session("tests/data/mlp.onnx", &bad);
+    if (b.ok || strstr(b.error, "key=value") == null) {
+        printf("FAIL: a malformed config was accepted\n");
+        return 1;
+    }
+    if (ort_api_version() < ORT_API_MIN_VERSION || ort_api_version() > ORT_API_VERSION) {
+        printf("FAIL: api version %d\n", (int)ort_api_version());
+        return 1;
+    }
+    printf("ok (OrtApi %d)\n", (int)ort_api_version());
+    return 0;
+}
