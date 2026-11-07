@@ -1,0 +1,274 @@
+// detect.esk: post-processing for detection models (<onnx/detect>).
+//
+// An SSD-style detector gives, for each of its anchors (prior boxes), a box encoded
+// relative to the anchor and class scores. These functions make the anchors from the
+// model's configuration, decode the boxes, keep the scores above a threshold and drop
+// overlapping boxes with greedy non-maximum suppression, in float32 with the same
+// operations, in the same order, as the numpy and PyTorch code such models ship with,
+// so the boxes come out bit for bit the same.
+//
+//     List<OnnxAnchor> anchors;
+//     onnx_anchors_grid(&anchors, 40, 40, 16.0, 640.0, 640.0, &ws[0], &hs[0], 2);
+//     OnnxBoxCoder coder = onnx_coder_variance(0.1, 0.2);
+//     onnx_boxes_decode(loc.f32(), anchors.data, anchors.size, &coder, boxes);
+//     List<int> found;
+//     onnx_scores_above(conf.f32() + 1, anchors.size, 2, 0.5, &found);
+//     List<int> keep;
+//     onnx_nms(boxes, conf.f32() + 1, 2, found.data, found.size, 0.4, &keep);
+
+import <mem>;
+import <list>;
+import <sort>;
+
+extern float expf(float x);
+
+// An anchor by its center and size, in the units of the encodings (usually fractions
+// of the model input).
+struct OnnxAnchor {
+    float cx;
+    float cy;
+    float w;
+    float h;
+}
+
+// A box by its corners.
+struct OnnxBox {
+    float x1;
+    float y1;
+    float x2;
+    float y2;
+}
+
+// n values from start to stop, as numpy.linspace(start, stop, n): i * step + start with
+// step = (stop - start) / (n - 1), the last one stop itself.
+void onnx_linspace(*double out, double start, double stop, int n) {
+    if (n <= 0) return;
+    if (n == 1) {
+        out[0] = start;
+        return;
+    }
+    double step = (stop - start) / (double)(n - 1);
+    for (i in 0..n) out[i] = (double)i * step + start;
+    out[n - 1] = stop;
+}
+
+// Appends the anchors of one feature map of rows x cols cells: row by row, column by
+// column, and in each cell one anchor per shape, widths[s] by heights[s], centered at
+// ((column + 0.5) * step / size_x, (row + 0.5) * step / size_y). Computed in double and
+// stored as float, as Python code that builds a list and converts it to float32.
+// RetinaFace-style priors take the layer's stride as step and the input size as
+// size_x and size_y; TensorFlow-style anchors in 0..1 take step 1 and size cols, rows.
+void onnx_anchors_grid(List<OnnxAnchor>* out, int rows, int cols, double step, double size_x, double size_y, *double widths, *double heights, int n) {
+    for (r in 0..rows) {
+        double cy = ((double)r + 0.5) * step / size_y;
+        for (c in 0..cols) {
+            double cx = ((double)c + 0.5) * step / size_x;
+            for (s in 0..n) List_push(out, OnnxAnchor{cx: (float)cx, cy: (float)cy, w: (float)widths[s], h: (float)heights[s]});
+        }
+    }
+}
+
+float _onnx_clampf(float v, float lo, float hi) {
+    if (v < lo) return lo;
+    if (v > hi) return hi;
+    return v;
+}
+
+// Clamps every value of n anchors into 0..1 (PriorBox's clip).
+void onnx_anchors_clip(*OnnxAnchor a, int n) {
+    for (i in 0..n) {
+        a[i].cx = _onnx_clampf(a[i].cx, 0.0, 1.0);
+        a[i].cy = _onnx_clampf(a[i].cy, 0.0, 1.0);
+        a[i].w = _onnx_clampf(a[i].w, 0.0, 1.0);
+        a[i].h = _onnx_clampf(a[i].h, 0.0, 1.0);
+    }
+}
+
+// How a box is encoded against its anchor. With variance unset (TensorFlow's
+// FasterRcnnBoxCoder, used by its SSDs): cx = tx / center * aw + acx, w = exp(tw / size)
+// * aw, and the corners are cx -+ w / 2. With variance set (SSD and RetinaFace in
+// PyTorch): cx = acx + tx * center * aw, w = aw * exp(tw * size), x1 = cx - w / 2 and
+// x2 = w + x1. yx says the encoding is (ty, tx, th, tw), TensorFlow's order, rather
+// than (tx, ty, tw, th).
+struct OnnxBoxCoder {
+    bool yx;
+    bool variance;
+    float center = 10.0;
+    float size = 5.0;
+}
+
+// TensorFlow's SSD encoding: (ty, tx, th, tw) with scale factors 10, 10, 5, 5.
+OnnxBoxCoder onnx_coder_tf() {
+    return OnnxBoxCoder{yx: true};
+}
+
+// The PyTorch SSD and RetinaFace encoding with these variances (usually 0.1, 0.2).
+OnnxBoxCoder onnx_coder_variance(float center, float size) {
+    return OnnxBoxCoder{variance: true, center: center, size: size};
+}
+
+// Decodes n boxes, four floats each in enc, against their anchors, into out (x1, y1,
+// x2, y2 in the anchors' units). Each step is one float32 operation, as numpy and
+// PyTorch evaluate the formulas; exp is the C library's expf.
+void onnx_boxes_decode(*float enc, *OnnxAnchor anchors, int n, *OnnxBoxCoder coder, *OnnxBox out) {
+    float two = 2.0;
+    float c = coder.center;
+    float s = coder.size;
+    for (i in 0..n) {
+        *float e = enc + (int64)i * 4;
+        float tx = e[0];
+        float ty = e[1];
+        float tw = e[2];
+        float th = e[3];
+        if (coder.yx) {
+            tx = e[1];
+            ty = e[0];
+            tw = e[3];
+            th = e[2];
+        }
+        OnnxAnchor a = anchors[i];
+        if (coder.variance) {
+            float ox = tx * c;
+            float oy = ty * c;
+            ox = ox * a.w;
+            oy = oy * a.h;
+            float cx = a.cx + ox;
+            float cy = a.cy + oy;
+            float w = a.w * expf(tw * s);
+            float h = a.h * expf(th * s);
+            float x1 = cx - w / two;
+            float y1 = cy - h / two;
+            out[i] = OnnxBox{x1: x1, y1: y1, x2: w + x1, y2: h + y1};
+        } else {
+            float ox = tx / c;
+            float oy = ty / c;
+            ox = ox * a.w;
+            oy = oy * a.h;
+            float cx = ox + a.cx;
+            float cy = oy + a.cy;
+            float w = expf(tw / s) * a.w;
+            float h = expf(th / s) * a.h;
+            float hw = w / two;
+            float hh = h / two;
+            out[i] = OnnxBox{x1: cx - hw, y1: cy - hh, x2: cx + hw, y2: cy + hh};
+        }
+    }
+}
+
+// Clamps n boxes into 0..w and 0..h (1, 1 for fractions of the input, as np.clip(boxes,
+// 0, 1)). A NaN stays NaN, as in numpy.
+void onnx_boxes_clamp(*OnnxBox b, int n, float w, float h) {
+    for (i in 0..n) {
+        b[i].x1 = _onnx_clampf(b[i].x1, 0.0, w);
+        b[i].y1 = _onnx_clampf(b[i].y1, 0.0, h);
+        b[i].x2 = _onnx_clampf(b[i].x2, 0.0, w);
+        b[i].y2 = _onnx_clampf(b[i].y2, 0.0, h);
+    }
+}
+
+// Appends to out each i in 0..n whose score scores[i * stride] is at least threshold,
+// in order (np.flatnonzero(scores >= threshold)). With a [N, classes] score tensor,
+// pass the class's column (scores + k) and stride classes.
+void onnx_scores_above(*float scores, int n, int stride, float threshold, List<int>* out) {
+    for (i in 0..n) {
+        if (scores[(int64)i * (int64)stride] >= threshold) List_push(out, i);
+    }
+}
+
+float _onnx_max0(float v) {
+    if (v < 0.0) return 0.0;
+    return v;
+}
+
+// numpy's maximum and minimum: a NaN in either operand is the result.
+float _onnx_fmax(float a, float b) {
+    if (a != a || a >= b) return a;
+    return b;
+}
+
+float _onnx_fmin(float a, float b) {
+    if (a != a || a <= b) return a;
+    return b;
+}
+
+float _onnx_area(OnnxBox b) {
+    return _onnx_max0(b.x2 - b.x1) * _onnx_max0(b.y2 - b.y1);
+}
+
+float _onnx_overlap(OnnxBox a, float area_a, OnnxBox b, float area_b) {
+    float iw = _onnx_max0(_onnx_fmin(a.x2, b.x2) - _onnx_fmax(a.x1, b.x1));
+    float ih = _onnx_max0(_onnx_fmin(a.y2, b.y2) - _onnx_fmax(a.y1, b.y1));
+    float inter = iw * ih;
+    float uni = area_a + area_b - inter;
+    if (uni > 0.0) return inter / uni;
+    return 0.0;
+}
+
+// The intersection over union of two boxes, 0 when the union is empty, computed as
+// onnx_nms does.
+float onnx_box_iou(OnnxBox a, OnnxBox b) {
+    return _onnx_overlap(a, _onnx_area(a), b, _onnx_area(b));
+}
+
+struct _OnnxRank {
+    float score;
+    int pos;
+}
+
+// Higher scores first, NaN before any number; equal scores, the later position first.
+int _onnx_rank_cmp(*_OnnxRank a, *_OnnxRank b) {
+    bool an = a.score != a.score;
+    bool bn = b.score != b.score;
+    if (an != bn) return an ? -1 : 1;
+    if (!an && a.score != b.score) return a.score > b.score ? -1 : 1;
+    if (a.pos != b.pos) return a.pos > b.pos ? -1 : 1;
+    return 0;
+}
+
+// Greedy non-maximum suppression: among the n candidates (indices into boxes and
+// scores, scores[i * stride] being box i's score; null for 0..n-1), the best scoring
+// box is kept and every remaining one that overlaps it by more than iou (intersection
+// over union, as onnx_box_iou) is dropped, until none is left. Appends the kept
+// indices to keep, best first. The order is np.argsort(scores, kind="stable")[::-1]:
+// equal scores keep the later candidate first, and a NaN score comes first. numpy's
+// default argsort gives the same order when no two scores are equal (and, being an
+// insertion sort there, for up to 16 candidates).
+void onnx_nms(*OnnxBox boxes, *float scores, int stride, *int candidates, int n, float iou, List<int>* keep) {
+    if (n <= 0) return;
+    *_OnnxRank rank = alloc<_OnnxRank>(n);
+    *int order = alloc<int>(n);
+    *float areas = alloc<float>(n);
+    defer {
+        free(rank);
+        free(order);
+        free(areas);
+    }
+    for (p in 0..n) {
+        int i = p;
+        if (candidates != null) i = candidates[p];
+        rank[p] = _OnnxRank{score: scores[(int64)i * (int64)stride], pos: p};
+    }
+    sort<_OnnxRank>(rank, n, _onnx_rank_cmp);
+    for (p in 0..n) {
+        int i = rank[p].pos;
+        if (candidates != null) i = candidates[i];
+        order[p] = i;
+        areas[p] = _onnx_area(boxes[i]);
+    }
+    int left = n;
+    while (left > 0) {
+        int cur = order[0];
+        float cur_area = areas[0];
+        List_push(keep, cur);
+        int m = 0;
+        for (k in 1..left) {
+            float o = _onnx_overlap(boxes[cur], cur_area, boxes[order[k]], areas[k]);
+            if (o <= iou) {
+                order[m] = order[k];
+                areas[m] = areas[k];
+                m++;
+            }
+        }
+        left = m;
+    }
+}
