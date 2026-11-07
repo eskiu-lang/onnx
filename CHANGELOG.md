@@ -23,6 +23,7 @@ All notable changes to this package are documented here. The format follows
   `onnx_linspace`, `onnx_boxes_decode` with `OnnxBoxCoder` (`onnx_coder_tf`,
   `onnx_coder_variance`), `onnx_boxes_clamp`, `onnx_scores_above`, `onnx_nms` and
   `onnx_box_iou`, bit for bit as numpy computes them.
+- Depends on gpu 0.5.0 (was 0.1.0) for image decoding.
 - `tools/gen_image_ref.py` and `tools/gen_detect_ref.py`, and the tests `image_exact` and
   `detect` that compare against their Pillow, OpenCV and numpy outputs.
 
