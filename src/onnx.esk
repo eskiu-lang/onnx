@@ -56,6 +56,9 @@ const int ONNX_WEBGPU = 5;
 // Android NNAPI (GPU, NPU or DSP); OnnxOptions.nnapi_flags takes ONNX_NNAPI_* bits.
 const int ONNX_NNAPI = 6;
 
+// Bits of OnnxOptions.nnapi_flags (ONNX Runtime's NNAPI flags): compute in float16 where
+// the device allows it, use NCHW layout, never fall back to NNAPI's CPU device, or use
+// only it.
 const uint32 ONNX_NNAPI_FP16 = 1;
 const uint32 ONNX_NNAPI_NCHW = 2;
 const uint32 ONNX_NNAPI_CPU_DISABLED = 4;
@@ -93,6 +96,9 @@ struct OnnxInfo {
     List<int64> shape;
 }
 
+// A loaded model: the ONNX Runtime session, its inputs and outputs (name, element type,
+// shape) and the execution provider it runs on. Make one with onnx_session or
+// onnx_session_bytes; release it with OnnxSession_release.
 struct OnnxSession {
     *OrtSession handle;
     List<OnnxInfo> inputs;
@@ -631,6 +637,7 @@ Result<OnnxSession, string> onnx_session_bytes(*uint8 data, uint64 len, *OnnxOpt
     return _onnx_open(null, data, len, opts);
 }
 
+// Releases the session and its input and output lists.
 void OnnxSession_release(*OnnxSession self) {
     if (self.handle != null) ort_ReleaseSession(self.handle);
     _onnx_info_free(&self.inputs);
@@ -656,10 +663,12 @@ bool OnnxSession_metadata(*OnnxSession self, string key, String* out) {
     return true;
 }
 
+// The number of model inputs.
 int OnnxSession_input_count(*OnnxSession self) {
     return self.inputs.size;
 }
 
+// The number of model outputs.
 int OnnxSession_output_count(*OnnxSession self) {
     return self.outputs.size;
 }
@@ -670,6 +679,7 @@ int OnnxSession_output_count(*OnnxSession self) {
     return &self.inputs.data[i];
 }
 
+// The i-th output's name, type and shape; null when i is out of range.
 *OnnxInfo OnnxSession_output(*OnnxSession self, int i) {
     if (i < 0 || i >= self.outputs.size) return null;
     return &self.outputs.data[i];
@@ -688,6 +698,7 @@ int OnnxSession_input_index(*OnnxSession self, string name) {
     return _onnx_find(&self.inputs, name);
 }
 
+// The index of the output with this name, or -1.
 int OnnxSession_output_index(*OnnxSession self, string name) {
     return _onnx_find(&self.outputs, name);
 }
@@ -947,26 +958,33 @@ Result<OnnxTensor, string> onnx_tensor_view(int type, *void data, *int64 shape, 
     return Ok<OnnxTensor, string>(t);
 }
 
+// A float32 tensor of the given shape with its elements copied from data (zero when data
+// is null).
 Result<OnnxTensor, string> onnx_tensor_f32(*float data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_FLOAT, (*void)data, shape, rank);
 }
 
+// A float16 tensor (elements as IEEE half bits) of the given shape, copied from data.
 Result<OnnxTensor, string> onnx_tensor_f16(*uint16 data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_FLOAT16, (*void)data, shape, rank);
 }
 
+// An int64 tensor of the given shape, copied from data.
 Result<OnnxTensor, string> onnx_tensor_i64(*int64 data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_INT64, (*void)data, shape, rank);
 }
 
+// An int32 tensor of the given shape, copied from data.
 Result<OnnxTensor, string> onnx_tensor_i32(*int data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_INT32, (*void)data, shape, rank);
 }
 
+// A uint8 tensor of the given shape, copied from data.
 Result<OnnxTensor, string> onnx_tensor_u8(*uint8 data, *int64 shape, int rank) {
     return onnx_tensor(ONNX_UINT8, (*void)data, shape, rank);
 }
 
+// Releases the tensor's memory and shape.
 void OnnxTensor_release(*OnnxTensor self) {
     if (self.value != null) ort_ReleaseValue(self.value);
     List_free(&self.shape);
@@ -979,6 +997,7 @@ void onnx_tensors_free(List<OnnxTensor>* l) {
     List_free(l);
 }
 
+// The number of dimensions.
 int OnnxTensor_rank(*OnnxTensor self) {
     return self.shape.size;
 }
@@ -1000,21 +1019,25 @@ uint64 OnnxTensor_len(*OnnxTensor self) {
     return (*float)self.data;
 }
 
+// The elements as float16 bits, or null when the tensor holds another type.
 *uint16 OnnxTensor_f16(*OnnxTensor self) {
     if (self.type != ONNX_FLOAT16) return null;
     return (*uint16)self.data;
 }
 
+// The elements as int64, or null when the tensor holds another type.
 *int64 OnnxTensor_i64(*OnnxTensor self) {
     if (self.type != ONNX_INT64) return null;
     return (*int64)self.data;
 }
 
+// The elements as int32, or null when the tensor holds another type.
 *int OnnxTensor_i32(*OnnxTensor self) {
     if (self.type != ONNX_INT32) return null;
     return (*int)self.data;
 }
 
+// The elements as uint8, or null when the tensor holds another type.
 *uint8 OnnxTensor_u8(*OnnxTensor self) {
     if (self.type != ONNX_UINT8) return null;
     return (*uint8)self.data;
