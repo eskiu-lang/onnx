@@ -23,6 +23,8 @@ jobs:
       - name: Tests
         # eskiuc downloads the ONNX Runtime archive the manifest names; ORT above is for the layout check.
         run: eskiuc test
+      - name: API reference is current
+        run: python3 -I tools/gen_api.py --check
       - name: Examples
         run: |
           mkdir -p build
