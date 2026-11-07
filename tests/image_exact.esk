@@ -1,0 +1,189 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <onnx/image>;
+
+// <onnx/image>'s library-exact resizers against the libraries themselves: Pillow 11
+// and 13 resizes (every filter, boxes, both pass orders) and float-box crops,
+// cv2.resize INTER_LINEAR, and MiniFASNet's crop rule and patches, byte for byte.
+// The outputs come from tools/gen_image_ref.py; the sources are made here with the
+// same integer generator.
+
+int[4] src_kind = {0, 1, 0, 1};
+int[4] src_w = {37, 64, 9, 10};
+int[4] src_h = {23, 48, 7, 8};
+int[4] src_seed = {1, 2, 3, 4};
+
+// Source i as RGBA, alpha 255.
+*uint8 source(int i) {
+    int w = src_w[i];
+    int h = src_h[i];
+    *uint8 p = alloc<uint8>((int64)w * (int64)h * 4);
+    uint32 s = (uint32)src_seed[i];
+    for (y in 0..h) {
+        for (x in 0..w) {
+            for (c in 0..4) {
+                int o = (y * w + x) * 4 + c;
+                if (c == 3) {
+                    p[o] = 255;
+                    continue;
+                }
+                s = s * 1103515245 + 12345;
+                int n = (int)((s >> 16) & 255);
+                if (src_kind[i] == 0) p[o] = (uint8)n;
+                else p[o] = (uint8)((x * 200 / w + y * 50 / h + c * 30 + (n >> 3)) & 255);
+            }
+        }
+    }
+    return p;
+}
+
+struct Reader {
+    *uint8 data;
+    int64 len;
+    int64 at;
+}
+
+int next_int(*Reader r) {
+    int v = 0;
+    memcpy(&v, r.data + r.at, 4);
+    r.at += 4;
+    return v;
+}
+
+double next_double(*Reader r) {
+    double v = 0.0;
+    memcpy(&v, r.data + r.at, 8);
+    r.at += 8;
+    return v;
+}
+
+int failures = 0;
+int checked = 0;
+
+// Compares the RGB of an RGBA image with an RGB reference.
+void compare(string what, int index, *uint8 got, *uint8 want, int w, int h) {
+    checked++;
+    if (got == null) {
+        printf("%s #%d: no output\n", what, index);
+        failures++;
+        return;
+    }
+    for (p in 0..w * h) {
+        for (c in 0..3) {
+            int g = (int)got[p * 4 + c];
+            int e = (int)want[p * 3 + c];
+            if (g != e) {
+                printf("%s #%d (%dx%d): pixel (%d, %d) channel %d is %d, want %d\n", what, index, w, h, p % w, p / w, c, g, e);
+                failures++;
+                return;
+            }
+        }
+    }
+}
+
+void run_file(string path, int pillow13) {
+    Reader r;
+    r.data = fs_read_all(path, &r.len);
+    if (r.data == null) {
+        printf("cannot read %s\n", path);
+        failures++;
+        return;
+    }
+    defer free(r.data);
+    *uint8[4] srcs;
+    for (i in 0..4) srcs[i] = source(i);
+    defer {
+        for (i in 0..4) free(srcs[i]);
+    }
+    int index = 0;
+    while (r.at < r.len) {
+        int kind = next_int(&r);
+        int src = next_int(&r);
+        int[8] ints;
+        int ni = next_int(&r);
+        for (i in 0..ni) ints[i] = next_int(&r);
+        double[8] d;
+        int nd = next_int(&r);
+        for (i in 0..nd) d[i] = next_double(&r);
+        int ow = next_int(&r);
+        int oh = next_int(&r);
+        *uint8 want = r.data + r.at;
+        r.at += (int64)ow * (int64)oh * 3;
+        int w = 0;
+        int h = 0;
+        *uint8 img = null;
+        if (src >= 0) {
+            w = src_w[src];
+            h = src_h[src];
+            img = srcs[src];
+        }
+        if (kind == 1) {
+            *uint8 got = onnx_image_resize_pillow_box(img, w, h, (float)d[0], (float)d[1], (float)d[2], (float)d[3], ints[1], ints[2], ints[0] | pillow13);
+            compare(pillow13 != 0 ? "pillow 13 resize" : "pillow resize", index, got, want, ow, oh);
+            free(got);
+        } else if (kind == 2) {
+            int cw = 0;
+            int ch = 0;
+            *uint8 got = onnx_image_crop_pillow(img, w, h, d[0], d[1], d[2], d[3], &cw, &ch);
+            if (cw != ow || ch != oh) {
+                printf("pillow crop #%d: %dx%d, want %dx%d\n", index, cw, ch, ow, oh);
+                failures++;
+            } else if (ow * oh > 0) {
+                compare("pillow crop", index, got, want, ow, oh);
+            }
+            free(got);
+        } else if (kind == 3) {
+            *uint8 got = onnx_image_resize_cv2(img, w, h, ints[0], ints[1]);
+            compare("cv2 resize", index, got, want, ow, oh);
+            free(got);
+        } else if (kind == 4) {
+            checked++;
+            OnnxRect b = onnx_minifasnet_box(ints[0], ints[1], d[0], d[1], d[2], d[3], d[4]);
+            if (b.x1 != ints[2] || b.y1 != ints[3] || b.x2 != ints[4] || b.y2 != ints[5]) {
+                printf("minifasnet box #%d: %d %d %d %d, want %d %d %d %d\n", index, b.x1, b.y1, b.x2, b.y2, ints[2], ints[3], ints[4], ints[5]);
+                failures++;
+            }
+        } else if (kind == 5) {
+            *uint8 got = onnx_minifasnet_crop(img, w, h, d[0], d[1], d[2], d[3], d[4], ints[0], ints[1]);
+            compare("minifasnet patch", index, got, want, ow, oh);
+            free(got);
+        }
+        index++;
+    }
+}
+
+int main() {
+    run_file("tests/data/pillow11.bin", 0);
+    run_file("tests/data/pillow13.bin", ONNX_PILLOW_13);
+    run_file("tests/data/cv2.bin", 0);
+    // Pillow 11's order on a shape where Pillow 13 differs must not match Pillow 13.
+    *uint8 img = source(1);
+    *uint8 a = onnx_image_resize_pillow(img, 64, 48, 60, 10, ONNX_PILLOW_BILINEAR);
+    *uint8 b = onnx_image_resize_pillow(img, 64, 48, 60, 10, ONNX_PILLOW_BILINEAR | ONNX_PILLOW_13);
+    if (memcmp(a, b, 60 * 10 * 4) == 0) {
+        printf("the two pass orders gave the same pixels\n");
+        failures++;
+    }
+    if (onnx_image_resize_pillow(img, 64, 48, 10, 10, 7) != null) {
+        printf("an unknown filter was accepted\n");
+        failures++;
+    }
+    if (onnx_image_resize_pillow_box(img, 64, 48, -1.0, 0.0, 10.0, 10.0, 5, 5, ONNX_PILLOW_BILINEAR) != null) {
+        printf("a box outside the image was accepted\n");
+        failures++;
+    }
+    free(a);
+    free(b);
+    free(img);
+    if (onnx_round_even(2.5) != 2 || onnx_round_even(3.5) != 4 || onnx_round_even(-2.5) != -2 || onnx_round_even(0.49) != 0) {
+        printf("onnx_round_even\n");
+        failures++;
+    }
+    if (failures > 0) {
+        printf("FAIL: %d of %d\n", failures, checked);
+        return 1;
+    }
+    printf("ok (%d cases)\n", checked);
+    return 0;
+}

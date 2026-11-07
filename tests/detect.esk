@@ -1,0 +1,233 @@
+import <io>;
+import <mem>;
+import <fs>;
+import <math>;
+import <onnx/detect>;
+
+// <onnx/detect> against tools/gen_detect_ref.py's numpy reference, bit for bit: the
+// face-pasive-liveness SSD's 5118 anchors, RetinaFace priors, both box encodings,
+// clipping, score selection and NMS (ties and a NaN score included).
+
+struct Reader {
+    *uint8 data;
+    int64 at;
+}
+
+int next_int(*Reader r) {
+    int v = 0;
+    memcpy(&v, r.data + r.at, 4);
+    r.at += 4;
+    return v;
+}
+
+*float floats(*Reader r, int n) {
+    *float p = (*float)(r.data + r.at);
+    r.at += (int64)n * 4;
+    return p;
+}
+
+int failures = 0;
+
+uint32 bits(float v) {
+    uint32 u = 0;
+    memcpy(&u, &v, 4);
+    return u;
+}
+
+// Equal bits, or both NaN.
+bool same(float a, float b) {
+    if (a != a && b != b) return true;
+    return bits(a) == bits(b);
+}
+
+void check_boxes(string what, *OnnxBox got, *float want, int n) {
+    for (i in 0..n) {
+        float[4] g = {got[i].x1, got[i].y1, got[i].x2, got[i].y2};
+        for (k in 0..4) {
+            if (!same(g[k], want[i * 4 + k])) {
+                printf("%s: box %d value %d is %.9g, want %.9g\n", what, i, k, (double)g[k], (double)want[i * 4 + k]);
+                failures++;
+                return;
+            }
+        }
+    }
+}
+
+// The face-pasive-liveness SSD (face_engines.generate_ssd_anchors): six square feature
+// maps, scales np.linspace(0.2, 0.95, 6), three shapes in the first layer and six in
+// the others, each (height, width).
+void ssd_anchors(List<OnnxAnchor>* out) {
+    int[6] maps = {32, 16, 8, 4, 2, 1};
+    double[6] scales;
+    onnx_linspace(&scales[0], 0.2, 0.95, 6);
+    double r2 = sqrt(2.0);
+    for (l in 0..6) {
+        double[6] hs;
+        double[6] ws;
+        int n = 0;
+        if (l == 0) {
+            hs[0] = 0.1;
+            ws[0] = 0.1;
+            hs[1] = 0.2 / r2;
+            ws[1] = 0.2 * r2;
+            hs[2] = 0.2 * r2;
+            ws[2] = 0.2 / r2;
+            n = 3;
+        } else {
+            double s = scales[l];
+            double next = 1.0;
+            if (l + 1 < 6) next = scales[l + 1];
+            hs[0] = s;
+            ws[0] = s;
+            hs[1] = sqrt(s * next);
+            ws[1] = hs[1];
+            double[4] ratios = {2.0, 0.5, 3.0, 1.0 / 3.0};
+            for (k in 0..4) {
+                hs[k + 2] = s / sqrt(ratios[k]);
+                ws[k + 2] = s * sqrt(ratios[k]);
+            }
+            n = 6;
+        }
+        double m = (double)maps[l];
+        onnx_anchors_grid(out, maps[l], maps[l], 1.0, m, m, &ws[0], &hs[0], n);
+    }
+}
+
+uint64 fnv_floats(uint64 h, *float v, int n) {
+    for (i in 0..n) {
+        uint32 u = bits(v[i]);
+        for (b in 0..4) {
+            h = (h ^ (uint64)((u >> (uint32)(b * 8)) & 255)) * 1099511628211;
+        }
+    }
+    return h;
+}
+
+int main() {
+    Reader r;
+    int64 len = 0;
+    r.data = fs_read_all("tests/data/detect.bin", &len);
+    if (r.data == null) {
+        printf("FAIL: cannot read tests/data/detect.bin\n");
+        return 1;
+    }
+    defer free(r.data);
+
+    // SSD anchors, hashed in face_engines' (cy, cx, h, w) order.
+    uint64 want_hash = 0;
+    memcpy(&want_hash, r.data, 8);
+    r.at = 8;
+    int count = next_int(&r);
+    List<OnnxAnchor> anchors;
+    defer List_free(&anchors);
+    ssd_anchors(&anchors);
+    uint64 h = 14695981039346656037;
+    for (i in 0..anchors.size) {
+        OnnxAnchor a = anchors.data[i];
+        float[4] v = {a.cy, a.cx, a.h, a.w};
+        h = fnv_floats(h, &v[0], 4);
+    }
+    if (anchors.size != count || h != want_hash) {
+        printf("SSD anchors: %d, hash %llx; want %d, %llx\n", anchors.size, h, count, want_hash);
+        failures++;
+    }
+
+    // RetinaFace priors for a 64x48 input: steps 8, 16, 32, min sizes {8, 16}, {32}, {64, 96}.
+    int np = next_int(&r);
+    *float want_priors = floats(&r, np * 4);
+    List<OnnxAnchor> priors;
+    defer List_free(&priors);
+    int[3] steps = {8, 16, 32};
+    double[2] m0 = {8.0, 16.0};
+    double[1] m1 = {32.0};
+    double[2] m2 = {64.0, 96.0};
+    *double[3] mins = {&m0[0], &m1[0], &m2[0]};
+    int[3] counts = {2, 1, 2};
+    for (k in 0..3) {
+        double[2] ws;
+        double[2] hs;
+        for (s in 0..counts[k]) {
+            ws[s] = mins[k][s] / 64.0;
+            hs[s] = mins[k][s] / 48.0;
+        }
+        int rows = (48 + steps[k] - 1) / steps[k];
+        int cols = (64 + steps[k] - 1) / steps[k];
+        onnx_anchors_grid(&priors, rows, cols, (double)steps[k], 64.0, 48.0, &ws[0], &hs[0], counts[k]);
+    }
+    onnx_anchors_clip(priors.data, priors.size);
+    if (priors.size != np) {
+        printf("RetinaFace priors: %d, want %d\n", priors.size, np);
+        failures++;
+    } else {
+        for (i in 0..np * 4) {
+            if (!same(((*float)priors.data)[i], want_priors[i])) {
+                printf("RetinaFace prior value %d differs\n", i);
+                failures++;
+                break;
+            }
+        }
+    }
+
+    // SSD decode, clip, scores and NMS.
+    int n = next_int(&r);
+    *float enc = floats(&r, n * 4);
+    *float want_boxes = floats(&r, n * 4);
+    *float scores = floats(&r, n * 2);
+    *OnnxAnchor picked = alloc<OnnxAnchor>(n);
+    *OnnxBox boxes = alloc<OnnxBox>(n);
+    defer {
+        free(picked);
+        free(boxes);
+    }
+    for (i in 0..n) picked[i] = anchors.data[(i * 997) % 5118];
+    OnnxBoxCoder tf = onnx_coder_tf();
+    onnx_boxes_decode(enc, picked, n, &tf, boxes);
+    check_boxes("SSD decode", boxes, want_boxes, n);
+
+    int nr = next_int(&r);
+    *float loc = floats(&r, nr * 4);
+    *float want_r = floats(&r, nr * 4);
+    *OnnxBox rboxes = alloc<OnnxBox>(nr);
+    defer free(rboxes);
+    OnnxBoxCoder var = onnx_coder_variance(0.1, 0.2);
+    onnx_boxes_decode(loc, priors.data, nr, &var, rboxes);
+    check_boxes("RetinaFace decode", rboxes, want_r, nr);
+
+    onnx_boxes_clamp(boxes, n, 1.0, 1.0);
+    List<int> found;
+    defer List_free(&found);
+    onnx_scores_above(scores + 1, n, 2, 0.5, &found);
+    int cases = 0;
+    while (r.at < len) {
+        int mode = next_int(&r);
+        float iou = floats(&r, 1)[0];
+        int k = next_int(&r);
+        List<int> keep;
+        if (mode == 1) onnx_nms(boxes, scores + 1, 2, found.data, found.size, iou, &keep);
+        else onnx_nms(boxes, scores + 1, 2, null, n, iou, &keep);
+        bool ok = keep.size == k;
+        for (i in 0..k) {
+            int want = next_int(&r);
+            if (ok && keep.data[i] != want) ok = false;
+        }
+        if (!ok) {
+            printf("NMS case %d (iou %.2f): kept %d boxes, want %d\n", cases, (double)iou, keep.size, k);
+            failures++;
+        }
+        List_free(&keep);
+        cases++;
+    }
+    OnnxBox a = OnnxBox{x1: 0.0, y1: 0.0, x2: 2.0, y2: 2.0};
+    OnnxBox b = OnnxBox{x1: 1.0, y1: 1.0, x2: 3.0, y2: 3.0};
+    float seventh = 1.0 / 7.0;
+    if (onnx_box_iou(a, b) != seventh) {
+        printf("onnx_box_iou %.9g\n", (double)onnx_box_iou(a, b));
+        failures++;
+    }
+    if (failures > 0) {
+        printf("FAIL: %d\n", failures);
+        return 1;
+    }
+    printf("ok (%d anchors, %d + %d boxes, %d NMS cases)\n", anchors.size, n, nr, cases);
+    return 0;
+}
