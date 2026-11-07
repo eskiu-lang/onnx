@@ -12,6 +12,7 @@
 
 import <mem>;
 import <string>;
+import <math>;
 import <result>;
 import <onnx>;
 
@@ -256,4 +257,415 @@ Result<OnnxTensor, string> onnx_image_tensor(*uint8 rgba, int w, int h, *OnnxIma
         return Err<OnnxTensor, string>(r.error);
     }
     return Ok<OnnxTensor, string>(t);
+}
+
+// Library-exact resizing. A model trained on images resized by Pillow or OpenCV gives
+// other scores when the pixels it sees differ by a level here and there, so these
+// reproduce each library's integer arithmetic rather than the ideal filter.
+
+extern double sin(double x);
+extern double cos(double x);
+extern double rint(double x);
+
+// Pillow's filters, numbered as Image.Resampling. ONNX_PILLOW_13 added to one takes
+// Pillow 13's pass order (see onnx_image_resize_pillow).
+const int ONNX_PILLOW_LANCZOS = 1;
+const int ONNX_PILLOW_BILINEAR = 2;
+const int ONNX_PILLOW_BICUBIC = 3;
+const int ONNX_PILLOW_BOX = 4;
+const int ONNX_PILLOW_HAMMING = 5;
+const int ONNX_PILLOW_13 = 256;
+
+double _onnx_pil_support(int filter) {
+    if (filter == ONNX_PILLOW_BOX) return 0.5;
+    if (filter == ONNX_PILLOW_BILINEAR || filter == ONNX_PILLOW_HAMMING) return 1.0;
+    if (filter == ONNX_PILLOW_BICUBIC) return 2.0;
+    if (filter == ONNX_PILLOW_LANCZOS) return 3.0;
+    return 0.0;
+}
+
+double _onnx_sinc(double x) {
+    if (x == 0.0) return 1.0;
+    double px = x * 3.14159265358979323846;
+    return sin(px) / px;
+}
+
+// The filters of Pillow's Resample.c, constants included (Hamming's are floats in C).
+double _onnx_pil_filter(int filter, double x) {
+    if (filter == ONNX_PILLOW_BOX) {
+        if (x > -0.5 && x <= 0.5) return 1.0;
+        return 0.0;
+    }
+    if (filter == ONNX_PILLOW_LANCZOS) {
+        if (-3.0 <= x && x < 3.0) return _onnx_sinc(x) * _onnx_sinc(x / 3.0);
+        return 0.0;
+    }
+    if (x < 0.0) x = -x;
+    if (filter == ONNX_PILLOW_BILINEAR) {
+        if (x < 1.0) return 1.0 - x;
+        return 0.0;
+    }
+    if (filter == ONNX_PILLOW_HAMMING) {
+        if (x == 0.0) return 1.0;
+        if (x >= 1.0) return 0.0;
+        double px = x * 3.14159265358979323846;
+        float c0 = 0.54;
+        float c1 = 0.46;
+        return sin(px) / px * ((double)c0 + (double)c1 * cos(px));
+    }
+    if (x < 1.0) return (1.5 * x - 2.5) * x * x + 1.0;
+    if (x < 2.0) return (((x - 5.0) * x + 8.0) * x - 4.0) * -0.5;
+    return 0.0;
+}
+
+// Pillow's precompute_coeffs and normalize_coeffs_8bpc for one axis: for each output
+// index, the first source index and the count in bounds, and ksize weights with 22
+// fractional bits, rounded away from zero.
+*int _onnx_pil_coeffs(int in_size, float in0, float in1, int out_size, int filter, *int bounds, *int ksize_out) {
+    float span = in1 - in0;
+    double scale = (double)span / (double)out_size;
+    double filterscale = scale;
+    if (filterscale < 1.0) filterscale = 1.0;
+    double support = _onnx_pil_support(filter) * filterscale;
+    int ksize = (int)ceil(support) * 2 + 1;
+    *double pre = alloc<double>((int64)out_size * (int64)ksize);
+    defer free(pre);
+    double inv = 1.0 / filterscale;
+    for (xx in 0..out_size) {
+        double center = (double)in0 + ((double)xx + 0.5) * scale;
+        int xmin = (int)(center - support + 0.5);
+        if (xmin < 0) xmin = 0;
+        int xmax = (int)(center + support + 0.5);
+        if (xmax > in_size) xmax = in_size;
+        xmax -= xmin;
+        *double k = pre + (int64)xx * (int64)ksize;
+        double ww = 0.0;
+        for (x in 0..xmax) {
+            double v = _onnx_pil_filter(filter, ((double)(x + xmin) - center + 0.5) * inv);
+            k[x] = v;
+            ww += v;
+        }
+        if (ww != 0.0) {
+            for (x in 0..xmax) k[x] = k[x] / ww;
+        }
+        bounds[xx * 2] = xmin;
+        bounds[xx * 2 + 1] = xmax;
+    }
+    *int kk = alloc<int>((int64)out_size * (int64)ksize);
+    double one = (double)(1 << 22);
+    for (i in 0..(int64)out_size * (int64)ksize) {
+        if (pre[i] < 0.0) kk[i] = (int)(-0.5 + pre[i] * one);
+        else kk[i] = (int)(0.5 + pre[i] * one);
+    }
+    *ksize_out = ksize;
+    return kk;
+}
+
+uint8 _onnx_pil_clip8(int64 v) {
+    int64 s = v >> 22;
+    if (s < 0) return 0;
+    if (s > 255) return 255;
+    return (uint8)s;
+}
+
+// The horizontal pass over rows row0 .. row0 + rows of src (sw wide) into dst (nw wide).
+void _onnx_pil_hpass(*uint8 src, int sw, int row0, int rows, *uint8 dst, int nw, *int bounds, *int kk, int ksize) {
+    for (y in 0..rows) {
+        int64 line = (int64)(row0 + y) * (int64)sw;
+        for (xx in 0..nw) {
+            int xmin = bounds[xx * 2];
+            int n = bounds[xx * 2 + 1];
+            *int k = kk + (int64)xx * (int64)ksize;
+            int64 o = ((int64)y * (int64)nw + (int64)xx) * 4;
+            for (c in 0..4) {
+                int64 acc = 1 << 21;
+                for (x in 0..n) acc += (int64)src[(line + (int64)(xmin + x)) * 4 + (int64)c] * (int64)k[x];
+                dst[o + (int64)c] = _onnx_pil_clip8(acc);
+            }
+        }
+    }
+}
+
+// The vertical pass of src (sw wide) into dst (sw wide, nh tall).
+void _onnx_pil_vpass(*uint8 src, int sw, *uint8 dst, int nh, *int bounds, *int kk, int ksize) {
+    for (yy in 0..nh) {
+        int ymin = bounds[yy * 2];
+        int n = bounds[yy * 2 + 1];
+        *int k = kk + (int64)yy * (int64)ksize;
+        for (x in 0..sw) {
+            int64 o = ((int64)yy * (int64)sw + (int64)x) * 4;
+            for (c in 0..4) {
+                int64 acc = 1 << 21;
+                for (y in 0..n) acc += (int64)src[((int64)(ymin + y) * (int64)sw + (int64)x) * 4 + (int64)c] * (int64)k[y];
+                dst[o + (int64)c] = _onnx_pil_clip8(acc);
+            }
+        }
+    }
+}
+
+// onnx_image_resize_pillow of the source region (x0, y0) .. (x1, y1), in float pixel
+// coordinates, as Image.resize with its box argument. null when the box leaves the
+// image, is empty, or an argument is invalid.
+*uint8 onnx_image_resize_pillow_box(*uint8 rgba, int w, int h, float x0, float y0, float x1, float y1, int nw, int nh, int filter) {
+    if (rgba == null || w <= 0 || h <= 0 || nw <= 0 || nh <= 0) return null;
+    int kind = filter & 255;
+    if (_onnx_pil_support(kind) == 0.0 || (filter & ~(255 | ONNX_PILLOW_13)) != 0) return null;
+    if (x0 < 0.0 || y0 < 0.0 || x1 > (float)w || y1 > (float)h || x1 < x0 || y1 < y0) return null;
+    bool need_h = nw != w || x0 != 0.0 || x1 != (float)nw;
+    bool need_v = nh != h || y0 != 0.0 || y1 != (float)nh;
+    bool hfirst = true;
+    if ((filter & ONNX_PILLOW_13) != 0) hfirst = !(h - nh > 0 && h - nh > (w - nw) * 2);
+    int64 size = (int64)nw * (int64)nh * 4;
+    if (!need_h && !need_v) {
+        *uint8 copy = alloc<uint8>(size);
+        memcpy(copy, rgba, size);
+        return copy;
+    }
+    *int vb = null;
+    *int vk = null;
+    int vks = 0;
+    if ((need_h && hfirst) || need_v) {
+        vb = alloc<int>((int64)nh * 2);
+        vk = _onnx_pil_coeffs(h, y0, y1, nh, kind, vb, &vks);
+    }
+    *int hb = null;
+    *int hk = null;
+    int hks = 0;
+    if (need_h) {
+        hb = alloc<int>((int64)nw * 2);
+        hk = _onnx_pil_coeffs(w, x0, x1, nw, kind, hb, &hks);
+    }
+    defer {
+        free(vb);
+        free(vk);
+        free(hb);
+        free(hk);
+    }
+    if (!hfirst) {
+        // Pillow 13: the height shrinks more than twice as much as the width.
+        *uint8 tall = alloc<uint8>((int64)w * (int64)nh * 4);
+        _onnx_pil_vpass(rgba, w, tall, nh, vb, vk, vks);
+        if (!need_h) return tall;
+        *uint8 out = alloc<uint8>(size);
+        _onnx_pil_hpass(tall, w, 0, nh, out, nw, hb, hk, hks);
+        free(tall);
+        return out;
+    }
+    *uint8 cur = rgba;
+    int cw = w;
+    if (need_h) {
+        // Only the rows the vertical pass reads, as Pillow's ybox_first .. ybox_last.
+        int first = vb[0];
+        int last = vb[nh * 2 - 2] + vb[nh * 2 - 1];
+        for (i in 0..nh) vb[i * 2] -= first;
+        cur = alloc<uint8>((int64)nw * (int64)(last - first) * 4);
+        _onnx_pil_hpass(rgba, w, first, last - first, cur, nw, hb, hk, hks);
+        cw = nw;
+        if (!need_v) return cur;
+    }
+    *uint8 out = alloc<uint8>(size);
+    _onnx_pil_vpass(cur, cw, out, nh, vb, vk, vks);
+    if (cur != rgba) free(cur);
+    return out;
+}
+
+// Resizes to nw x nh as Pillow's Image.resize does, byte for byte: filter is
+// ONNX_PILLOW_BILINEAR, _BICUBIC, _LANCZOS, _BOX or _HAMMING, with Pillow's support
+// scaling when shrinking, its 22-bit fixed-point weights and the clip to 8 bits
+// between the horizontal and the vertical pass. Pillow 11 and 12 always run the
+// horizontal pass first; Pillow 13 runs the vertical one first when the height
+// shrinks by more than twice as many pixels as the width, which ONNX_PILLOW_13 in
+// filter selects. The four channels are resampled alike, as Pillow resizes an RGB
+// image; for RGBA with transparency Pillow premultiplies the alpha first, which this
+// does not. (After the BILINEAR resampler of the face-pasive-liveness service's
+// native/image.esk.)
+*uint8 onnx_image_resize_pillow(*uint8 rgba, int w, int h, int nw, int nh, int filter) {
+    return onnx_image_resize_pillow_box(rgba, w, h, 0.0, 0.0, (float)w, (float)h, nw, nh, filter);
+}
+
+// Python's round(): to the nearest integer, halves to the even one.
+int onnx_round_even(double v) {
+    return (int)rint(v);
+}
+
+// Pillow's Image.crop with a float box: each coordinate rounded with round() (halves
+// to even), the region (x0, y0) .. (x1, y1) of the rounded values, zeros where it
+// leaves the image. Sets *cw and *ch to its size; null when it is empty.
+*uint8 onnx_image_crop_pillow(*uint8 rgba, int w, int h, double x0, double y0, double x1, double y1, *int cw, *int ch) {
+    int l = onnx_round_even(x0);
+    int t = onnx_round_even(y0);
+    int r = onnx_round_even(x1);
+    int b = onnx_round_even(y1);
+    int rw = r - l;
+    int rh = b - t;
+    if (rw < 0) rw = 0;
+    if (rh < 0) rh = 0;
+    if (cw != null) *cw = rw;
+    if (ch != null) *ch = rh;
+    return onnx_image_crop(rgba, w, h, l, t, rw, rh, ONNX_BORDER_ZERO);
+}
+
+// OpenCV's source offsets and 11-bit weights for one axis of INTER_LINEAR: the sample
+// at (i + 0.5) * scale - 0.5 in float, weights rounded half to even. x clamps the
+// offset as the horizontal pass does; the vertical pass clamps rows when it reads.
+void _onnx_cv_axis(int n, int nn, bool x, *int ofs, *int w0, *int w1) {
+    double inv = (double)nn / (double)n;
+    double scale = 1.0 / inv;
+    float one = 1.0;
+    float coef = 2048.0;
+    for (i in 0..nn) {
+        float f = (float)(((double)i + 0.5) * scale - 0.5);
+        int s = (int)f;
+        if ((float)s > f) s--;
+        f = f - (float)s;
+        if (x && s < 0) {
+            s = 0;
+            f = 0.0;
+        }
+        if (x && s >= n - 1) {
+            s = n - 1;
+            f = 0.0;
+        }
+        float a = one - f;
+        float a0 = a * coef;
+        float a1 = f * coef;
+        ofs[i] = s;
+        w0[i] = (int)rint((double)a0);
+        w1[i] = (int)rint((double)a1);
+    }
+}
+
+// Resizes to nw x nh as OpenCV's cv2.resize with INTER_LINEAR (the default) does on
+// 8-bit images, byte for byte: the half-pixel sample positions in float, 11-bit
+// weights, the exact horizontal pass and OpenCV's vertical rounding
+// ((((h0 >> 4) * b0) >> 16) + (((h1 >> 4) * b1) >> 16) + 2) >> 2. That is OpenCV's own
+// code, which every build runs except where a CPU-specific library takes over: arm64
+// builds with KleidiCV (the opencv-python 5.0 wheel for macOS arm64) shrink both
+// sides of an image with up to 3 channels by 1 to 3 times with an approximation that
+// differs by a level, and Carotene (arm builds) resizes 1 and 4 channel images
+// itself. Each channel is computed alike, so the RGB of an RGBA image matches
+// cv2.resize of the 3-channel image.
+*uint8 onnx_image_resize_cv2(*uint8 rgba, int w, int h, int nw, int nh) {
+    if (rgba == null || w <= 0 || h <= 0 || nw <= 0 || nh <= 0) return null;
+    int64 size = (int64)nw * (int64)nh * 4;
+    *uint8 out = alloc<uint8>(size);
+    if (nw == w && nh == h) {
+        memcpy(out, rgba, size);
+        return out;
+    }
+    *int xo = alloc<int>(nw);
+    *int xa = alloc<int>(nw);
+    *int xb = alloc<int>(nw);
+    *int yo = alloc<int>(nh);
+    *int ya = alloc<int>(nh);
+    *int yb = alloc<int>(nh);
+    *int row0 = alloc<int>((int64)nw * 4);
+    *int row1 = alloc<int>((int64)nw * 4);
+    defer {
+        free(xo);
+        free(xa);
+        free(xb);
+        free(yo);
+        free(ya);
+        free(yb);
+        free(row0);
+        free(row1);
+    }
+    _onnx_cv_axis(w, nw, true, xo, xa, xb);
+    _onnx_cv_axis(h, nh, false, yo, ya, yb);
+    for (j in 0..nh) {
+        int r0 = yo[j];
+        int r1 = r0 + 1;
+        if (r0 < 0) r0 = 0;
+        if (r0 > h - 1) r0 = h - 1;
+        if (r1 < 0) r1 = 0;
+        if (r1 > h - 1) r1 = h - 1;
+        *int[2] rows = {row0, row1};
+        int[2] src_rows = {r0, r1};
+        for (k in 0..2) {
+            int64 line = (int64)src_rows[k] * (int64)w;
+            *int d = rows[k];
+            for (i in 0..nw) {
+                int sx = xo[i];
+                int sx1 = sx + 1;
+                if (sx1 > w - 1) sx1 = w - 1;
+                int64 p = (line + (int64)sx) * 4;
+                int64 q = (line + (int64)sx1) * 4;
+                for (c in 0..4) d[i * 4 + c] = (int)rgba[p + (int64)c] * xa[i] + (int)rgba[q + (int64)c] * xb[i];
+            }
+        }
+        int b0 = ya[j];
+        int b1 = yb[j];
+        int64 o = (int64)j * (int64)nw * 4;
+        for (e in 0..nw * 4) {
+            int v = ((((row0[e] >> 4) * b0) >> 16) + (((row1[e] >> 4) * b1) >> 16) + 2) >> 2;
+            if (v < 0) v = 0;
+            if (v > 255) v = 255;
+            out[o + (int64)e] = (uint8)v;
+        }
+    }
+    return out;
+}
+
+// A box by its corner pixels, both included.
+struct OnnxRect {
+    int x1;
+    int y1;
+    int x2;
+    int y2;
+}
+
+// The crop of Minivision's Silent-Face-Anti-Spoofing (CropImage._get_new_box) for a
+// face box (x, y, w, h) in a src_w x src_h image: the box scaled by scale about its
+// center (MiniFASNet uses 2.7 and 4.0), the scale first lowered so the crop fits in
+// (src_w - 1) x (src_h - 1), and a crop that leaves the image shifted inward rather
+// than cut. Corners truncated toward zero as Python's int(). An empty rect
+// (x2 < x1) when w or h is not positive.
+OnnxRect onnx_minifasnet_box(int src_w, int src_h, double x, double y, double w, double h, double scale) {
+    if (w <= 0.0 || h <= 0.0) return OnnxRect{x1: 0, y1: 0, x2: -1, y2: -1};
+    double s = scale;
+    double sw = (double)(src_w - 1) / w;
+    if (sw < s) s = sw;
+    double sh = (double)(src_h - 1) / h;
+    if (sh < s) s = sh;
+    double nw = w * s;
+    double nh = h * s;
+    double cx = w / 2.0 + x;
+    double cy = h / 2.0 + y;
+    double lx = cx - nw / 2.0;
+    double ly = cy - nh / 2.0;
+    double rx = cx + nw / 2.0;
+    double ry = cy + nh / 2.0;
+    if (lx < 0.0) {
+        rx -= lx;
+        lx = 0.0;
+    }
+    if (ly < 0.0) {
+        ry -= ly;
+        ly = 0.0;
+    }
+    if (rx > (double)(src_w - 1)) {
+        lx -= rx - (double)src_w + 1.0;
+        rx = (double)(src_w - 1);
+    }
+    if (ry > (double)(src_h - 1)) {
+        ly -= ry - (double)src_h + 1.0;
+        ry = (double)(src_h - 1);
+    }
+    return OnnxRect{x1: (int)lx, y1: (int)ly, x2: (int)rx, y2: (int)ry};
+}
+
+// MiniFASNet's input patch: the onnx_minifasnet_box crop (corners included, as
+// img[y1:y2 + 1, x1:x2 + 1]) resized to out_w x out_h with onnx_image_resize_cv2, as
+// the upstream CropImage.crop does with cv2.resize. The model then takes it as BGR
+// floats in 0..255 (OnnxImageFormat{bgr: true}). null when the box is empty.
+*uint8 onnx_minifasnet_crop(*uint8 rgba, int w, int h, double x, double y, double bw, double bh, double scale, int out_w, int out_h) {
+    if (rgba == null || w <= 0 || h <= 0) return null;
+    OnnxRect r = onnx_minifasnet_box(w, h, x, y, bw, bh, scale);
+    if (r.x2 < r.x1 || r.y2 < r.y1) return null;
+    int cw = r.x2 - r.x1 + 1;
+    int ch = r.y2 - r.y1 + 1;
+    *uint8 crop = onnx_image_crop(rgba, w, h, r.x1, r.y1, cw, ch, ONNX_BORDER_CLAMP);
+    defer free(crop);
+    return onnx_image_resize_cv2(crop, cw, ch, out_w, out_h);
 }
