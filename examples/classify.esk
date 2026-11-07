@@ -69,7 +69,7 @@ Result<int, string> classify(*Args a) {
     if (h <= 0) h = 224;
     if (w <= 0) w = 224;
 
-    Image img = image_load(a.image)?;
+    Bitmap img = image_load(a.image)?;
     defer img.free();
     int iw = (int)img.width;
     int ih = (int)img.height;

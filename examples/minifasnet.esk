@@ -40,7 +40,7 @@ struct Face {
 }
 
 // The 128x128 RGBA crop the model sees.
-*uint8 face_crop(*Image img, *Face f) {
+*uint8 face_crop(*Bitmap img, *Face f) {
     int iw = (int)img.width;
     int ih = (int)img.height;
     int w = f.x2 - f.x1;
@@ -70,7 +70,7 @@ Result<int, string> check(string model, string path, *Face f) {
     OnnxOptions opts = OnnxOptions{provider: f.provider, fallback: true};
     OnnxSession s = onnx_session(model, &opts)?;
     defer s.release();
-    Image img = image_load(path)?;
+    Bitmap img = image_load(path)?;
     defer img.free();
     if (f.x2 == 0 && f.y2 == 0) {
         f.x2 = (int)img.width;
