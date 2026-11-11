@@ -4,7 +4,7 @@ version = "0.2.0"
 main = "examples/classify.esk"
 
 [deps]
-gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "v0.5.0" }
+gpu = { git = "https://github.com/eskiu-lang/gpu", rev = "v0.6.0" }
 
 # ONNX Runtime's own release archives, fetched by eskiuc build / run / test / fetch.
 [native.onnxruntime]
