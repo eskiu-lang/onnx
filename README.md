@@ -13,7 +13,7 @@
 </p>
 
 <p align="center">
-  <a href="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml"><img src="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
+  <a href="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml?query=branch%3Adevelop"><img src="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml/badge.svg?branch=develop" alt="CI"></a>
   <img src="https://img.shields.io/badge/version-0.2.2-6448d4" alt="Version 0.2.2">
   <img src="https://img.shields.io/badge/ONNX%20Runtime-1.31-orange" alt="ONNX Runtime 1.31">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
