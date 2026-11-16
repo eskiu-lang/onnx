@@ -105,7 +105,7 @@ onnx: input 'x' is int64, the model wants float
 
 ## Install
 
-In an Eskiu package (Eskiu 0.15.1 or newer, for gpu 0.7.0):
+In an Eskiu package (Eskiu 0.15.1 or newer, for gpu 0.7.1):
 
 ```bash
 eskiuc add onnx --git https://github.com/eskiu-packages/onnx --rev v0.2.1
