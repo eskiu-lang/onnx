@@ -14,7 +14,7 @@
 
 <p align="center">
   <a href="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml"><img src="https://github.com/eskiu-packages/onnx/actions/workflows/ci.yml/badge.svg" alt="CI"></a>
-  <img src="https://img.shields.io/badge/version-0.2.1-6448d4" alt="Version 0.2.1">
+  <img src="https://img.shields.io/badge/version-0.2.2-6448d4" alt="Version 0.2.2">
   <img src="https://img.shields.io/badge/ONNX%20Runtime-1.31-orange" alt="ONNX Runtime 1.31">
   <a href="LICENSE"><img src="https://img.shields.io/badge/license-MIT-blue" alt="License: MIT"></a>
 </p>
@@ -108,7 +108,7 @@ onnx: input 'x' is int64, the model wants float
 In an Eskiu package (Eskiu 0.15.1 or newer, for gpu 0.7.1):
 
 ```bash
-eskiuc add onnx --git https://github.com/eskiu-packages/onnx --rev v0.2.1
+eskiuc add onnx --git https://github.com/eskiu-packages/onnx --rev v0.2.2
 eskiuc build
 ```
 
