@@ -8,7 +8,7 @@ All notable changes to this package are documented here. The format follows
 
 ### Changed
 
-- The package moved to the eskiu-packages organization; the old URL redirects. gpu 0.7.1.
+- The package moved to the eskiu-packages organization; the old URL redirects. Depends on gpu 0.7.1.
 
 ## [0.2.1]
 
