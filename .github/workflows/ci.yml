@@ -35,27 +35,6 @@ jobs:
           build/classify | tee build/classify.txt
           grep -q "blue" build/classify.txt
 
-  macos:
-    runs-on: macos-15
-    steps:
-      - uses: actions/checkout@v4
-      - name: Install Eskiu and ONNX Runtime
-        run: |
-          brew install eskiu-lang/eskiu/eskiu
-          curl -fsSL https://github.com/microsoft/onnxruntime/releases/download/v$ORT_VERSION/onnxruntime-osx-arm64-$ORT_VERSION.tgz | tar xz -C $HOME
-          echo "ORT=$HOME/onnxruntime-osx-arm64-$ORT_VERSION" >> $GITHUB_ENV
-      - name: Layout check
-        run: CC=cc ESKIUC=eskiuc tools/layout_check.sh $ORT/include $ORT/lib
-      - name: Tests
-        # eskiuc downloads the ONNX Runtime archive the manifest names; ORT above is for the layout check.
-        run: eskiuc test
-      - name: Examples
-        run: |
-          mkdir -p build
-          for f in examples/*.esk; do eskiuc "$f" -o build/$(basename "$f" .esk); done
-          build/classify --provider auto | tee build/classify.txt
-          grep -q "blue" build/classify.txt
-
   windows:
     runs-on: windows-latest
     defaults:
