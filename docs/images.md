@@ -91,7 +91,7 @@ OnnxTensor t = onnx_image_tensor(patch, 80, 80, &bgr)?;
 ```
 
 Decoding image files is left to other packages. The examples use `<gpu/image>` from
-[gpu](https://github.com/eskiu-lang/gpu), a dependency of this package, which decodes PNG
+[gpu](https://github.com/eskiu-packages/gpu), a dependency of this package, which decodes PNG
 and JPEG in pure Eskiu and needs no GPU (`image_load` gives `width`, `height` and `rgba`).
 Pixels from anywhere else (a camera, a video frame, a raw file) work the same once they are
 RGBA.
